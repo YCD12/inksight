@@ -7,5 +7,5 @@ export async function GET(
 ) {
   const { mac } = await params;
   const qs = req.nextUrl.search;
-  return proxyGet(`/api/device/${encodeURIComponent(mac)}/history${qs}`);
+  return proxyGet(`/api/device/${encodeURIComponent(mac)}/history${qs}`, req);
 }

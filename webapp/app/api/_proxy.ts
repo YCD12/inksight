@@ -14,10 +14,22 @@ function imageHeadersFromUpstream(res: Response, contentType: string): HeadersIn
   return headers;
 }
 
-export async function proxyGet(pathWithQuery: string) {
+function passthroughHeaders(req?: NextRequest, extra?: Record<string, string>): HeadersInit {
+  const headers: Record<string, string> = { ...(extra || {}) };
+  if (!req) return headers;
+  const authorization = req.headers.get("authorization");
+  const cookie = req.headers.get("cookie");
+  const deviceToken = req.headers.get("x-device-token");
+  if (authorization) headers.authorization = authorization;
+  if (cookie) headers.cookie = cookie;
+  if (deviceToken) headers["x-device-token"] = deviceToken;
+  return headers;
+}
+
+export async function proxyGet(pathWithQuery: string, req?: NextRequest) {
   const target = `${backendBase}${pathWithQuery}`;
   try {
-    const res = await fetch(target, { cache: "no-store" });
+    const res = await fetch(target, { cache: "no-store", headers: passthroughHeaders(req) });
     const ct = res.headers.get("content-type") || "";
     if (ct.includes("image/")) {
       const buf = await res.arrayBuffer();
@@ -53,7 +65,7 @@ export async function proxyPost(
     const body = await req.arrayBuffer();
     const res = await fetch(target, {
       method: "POST",
-      headers: { "content-type": ct, ...(extraHeaders || {}) },
+      headers: passthroughHeaders(req, { "content-type": ct, ...(extraHeaders || {}) }),
       body,
     });
     const resCt = res.headers.get("content-type") || "";
@@ -87,7 +99,7 @@ export async function proxyPut(path: string, req: NextRequest) {
     const body = await req.arrayBuffer();
     const res = await fetch(target, {
       method: "PUT",
-      headers: { "content-type": ct },
+      headers: passthroughHeaders(req, { "content-type": ct }),
       body,
     });
     const resCt = res.headers.get("content-type") || "";
@@ -107,10 +119,10 @@ export async function proxyPut(path: string, req: NextRequest) {
   }
 }
 
-export async function proxyDelete(path: string) {
+export async function proxyDelete(path: string, req?: NextRequest) {
   const target = `${backendBase}${path}`;
   try {
-    const res = await fetch(target, { method: "DELETE" });
+    const res = await fetch(target, { method: "DELETE", headers: passthroughHeaders(req) });
     const ct = res.headers.get("content-type") || "";
     if (ct.includes("application/json")) {
       return NextResponse.json(await res.json(), { status: res.status });

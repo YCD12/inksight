@@ -15,7 +15,6 @@ import {
   BarChart3,
   RefreshCw,
   Heart,
-  ChevronRight,
   ChevronDown,
   Save,
   AlertCircle,
@@ -28,13 +27,39 @@ import {
   ArrowLeft,
   X,
 } from "lucide-react";
-import { authHeaders, onAuthChanged } from "@/lib/auth";
+import { authHeaders, fetchCurrentUser, onAuthChanged } from "@/lib/auth";
 
 interface UserDevice {
   mac: string;
   nickname: string;
   bound_at: string;
   last_seen: string | null;
+  role?: string;
+  status?: string;
+}
+
+interface DeviceMember {
+  user_id: number;
+  username: string;
+  role: string;
+  status: string;
+  nickname?: string;
+  created_at: string;
+}
+
+interface AccessRequestItem {
+  id: number;
+  mac: string;
+  requester_user_id: number;
+  requester_username: string;
+  status: string;
+  created_at: string;
+}
+
+interface DiscoveredDeviceItem {
+  mac: string;
+  last_seen: string | null;
+  has_owner: boolean;
 }
 
 const MODE_META: Record<string, { name: string; tip: string }> = {
@@ -262,17 +287,23 @@ type RuntimeMode = "active" | "interval" | "unknown";
 function ConfigPageInner() {
   const searchParams = useSearchParams();
   const mac = searchParams.get("mac") || "";
-  const [discoveredDevice, setDiscoveredDevice] = useState<string | null>(null);
+  const [discoveredDevices, setDiscoveredDevices] = useState<DiscoveredDeviceItem[]>([]);
 
   const [currentUser, setCurrentUser] = useState<{ user_id: number; username: string } | null | undefined>(undefined);
   const [userDevices, setUserDevices] = useState<UserDevice[]>([]);
   const [devicesLoading, setDevicesLoading] = useState(false);
   const [bindMacInput, setBindMacInput] = useState("");
   const [bindNicknameInput, setBindNicknameInput] = useState("");
+  const [deviceMembers, setDeviceMembers] = useState<DeviceMember[]>([]);
+  const [pendingRequests, setPendingRequests] = useState<AccessRequestItem[]>([]);
+  const [membersLoading, setMembersLoading] = useState(false);
+  const [requestsLoading, setRequestsLoading] = useState(false);
+  const [shareUsernameInput, setShareUsernameInput] = useState("");
+  const [detectingDevice, setDetectingDevice] = useState(false);
+  const [macAccessDenied, setMacAccessDenied] = useState(false);
 
   const refreshCurrentUser = useCallback(() => {
-    fetch("/api/auth/me", { headers: authHeaders() })
-      .then((r) => (r.ok ? r.json() : null))
+    fetchCurrentUser()
       .then((d) => setCurrentUser(d ? { user_id: d.user_id, username: d.username } : null))
       .catch(() => setCurrentUser(null));
   }, []);
@@ -303,9 +334,44 @@ function ConfigPageInner() {
     finally { setDevicesLoading(false); }
   }, []);
 
+  const loadPendingRequests = useCallback(async () => {
+    setRequestsLoading(true);
+    try {
+      const res = await fetch("/api/user/devices/requests", { headers: authHeaders() });
+      if (res.ok) {
+        const data = await res.json();
+        setPendingRequests(data.requests || []);
+      }
+    } catch { /* ignore */ }
+    finally { setRequestsLoading(false); }
+  }, []);
+
+  const loadDeviceMembers = useCallback(async (deviceMac: string) => {
+    if (!deviceMac) return;
+    setMembersLoading(true);
+    try {
+      const res = await fetch(`/api/user/devices/${encodeURIComponent(deviceMac)}/members`, {
+        headers: authHeaders(),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setDeviceMembers(data.members || []);
+      } else {
+        setDeviceMembers([]);
+      }
+    } catch {
+      setDeviceMembers([]);
+    } finally {
+      setMembersLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
-    if (currentUser && !mac) loadUserDevices();
-  }, [currentUser, mac, loadUserDevices]);
+    if (currentUser) {
+      loadUserDevices();
+      loadPendingRequests();
+    }
+  }, [currentUser, loadPendingRequests, loadUserDevices]);
 
   const handleBindDevice = async (deviceMac: string, nickname?: string) => {
     try {
@@ -314,14 +380,17 @@ function ConfigPageInner() {
         headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ mac: deviceMac, nickname: nickname || "" }),
       });
+      const data = await res.json().catch(() => ({}));
       if (res.ok) {
         await loadUserDevices();
+        await loadPendingRequests();
         setBindMacInput("");
         setBindNicknameInput("");
-        return true;
+        setDiscoveredDevices((prev) => prev.filter((item) => item.mac.toUpperCase() !== deviceMac.toUpperCase()));
+        return data;
       }
     } catch { /* ignore */ }
-    return false;
+    return null;
   };
 
   const handleUnbindDevice = async (deviceMac: string) => {
@@ -332,6 +401,106 @@ function ConfigPageInner() {
       });
       if (res.ok) await loadUserDevices();
     } catch { /* ignore */ }
+  };
+
+  const handleApproveRequest = async (requestId: number) => {
+    try {
+      const res = await fetch(`/api/user/devices/requests/${requestId}/approve`, {
+        method: "POST",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: "{}",
+      });
+      if (res.ok) {
+        await loadPendingRequests();
+        if (mac) await loadDeviceMembers(mac);
+        showToast("已同意绑定请求", "success");
+      } else {
+        showToast("同意失败", "error");
+      }
+    } catch {
+      showToast("同意失败", "error");
+    }
+  };
+
+  const handleRejectRequest = async (requestId: number) => {
+    try {
+      const res = await fetch(`/api/user/devices/requests/${requestId}/reject`, {
+        method: "POST",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: "{}",
+      });
+      if (res.ok) {
+        await loadPendingRequests();
+        showToast("已拒绝绑定请求", "success");
+      } else {
+        showToast("拒绝失败", "error");
+      }
+    } catch {
+      showToast("拒绝失败", "error");
+    }
+  };
+
+  const handleShareDevice = async () => {
+    if (!mac || !shareUsernameInput.trim()) return;
+    try {
+      const res = await fetch(`/api/user/devices/${encodeURIComponent(mac)}/share`, {
+        method: "POST",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ username: shareUsernameInput.trim() }),
+      });
+      if (!res.ok) throw new Error("share failed");
+      setShareUsernameInput("");
+      await loadDeviceMembers(mac);
+      await loadPendingRequests();
+      showToast("分享成功", "success");
+    } catch {
+      showToast("分享失败", "error");
+    }
+  };
+
+  const handleRemoveMember = async (targetUserId: number) => {
+    if (!mac) return;
+    try {
+      const res = await fetch(`/api/user/devices/${encodeURIComponent(mac)}/members/${targetUserId}`, {
+        method: "DELETE",
+        headers: authHeaders(),
+      });
+      if (!res.ok) throw new Error("remove failed");
+      await loadDeviceMembers(mac);
+      showToast("成员已移除", "success");
+    } catch {
+      showToast("移除成员失败", "error");
+    }
+  };
+
+  const handleDetectDevice = async () => {
+    setDetectingDevice(true);
+    try {
+      const res = await fetch("/api/discovery?minutes=15", { cache: "no-store" });
+      if (!res.ok) {
+        showToast("检测设备失败", "error");
+        return;
+      }
+      const data = await res.json();
+      const owned = new Set(userDevices.map((d) => d.mac.toUpperCase()));
+      const devices: DiscoveredDeviceItem[] = (data.devices || [])
+        .filter((d: DiscoveredDeviceItem) => d?.mac && !owned.has(d.mac.toUpperCase()))
+        .map((d: DiscoveredDeviceItem) => ({
+          mac: d.mac,
+          last_seen: typeof d.last_seen === "string" ? d.last_seen : null,
+          has_owner: Boolean(d.has_owner),
+        }));
+      setDiscoveredDevices(devices);
+      if (devices.length > 0) {
+        showToast(`已检测到 ${devices.length} 台最近上线设备`, "success");
+      } else {
+        showToast("未检测到设备，可按复位按钮让设备重新上线后再试", "info");
+      }
+    } catch {
+      showToast("检测设备失败", "error");
+    } finally {
+      setDetectingDevice(false);
+    }
   };
 
   const [activeTab, setActiveTab] = useState<TabId>("modes");
@@ -398,31 +567,26 @@ function ConfigPageInner() {
   }, []);
 
   useEffect(() => {
-    if (mac || discoveredDevice || !currentUser) return;
-    let cancelled = false;
-    const poll = async () => {
-      try {
-        const res = await fetch("/api/discovery?minutes=5", { cache: "no-store" });
-        if (!res.ok) return;
-        const data = await res.json();
-        const macs: string[] = (data.devices || []).map((d: { mac: string }) => d.mac);
-        const owned = new Set(userDevices.map((d) => d.mac.toUpperCase()));
-        const candidate = macs.find((m) => m && !owned.has(m.toUpperCase()));
-        if (candidate && !cancelled) {
-          setDiscoveredDevice(candidate);
-          await handleBindDevice(candidate);
-        }
-      } catch { /* ignore */ }
-    };
-    poll();
-    const interval = setInterval(poll, 5000);
-    return () => { cancelled = true; clearInterval(interval); };
-  }, [mac, discoveredDevice, currentUser, userDevices]);
+    if (mac && currentUser) {
+      loadDeviceMembers(mac);
+      loadPendingRequests();
+    }
+  }, [currentUser, loadDeviceMembers, loadPendingRequests, mac]);
+
+  useEffect(() => {
+    setMacAccessDenied(false);
+  }, [mac]);
 
   useEffect(() => {
     if (!mac) return;
-    fetch(`/api/device/${encodeURIComponent(mac)}/state`)
-      .then((r) => r.ok ? r.json() : null)
+    fetch(`/api/device/${encodeURIComponent(mac)}/state`, { headers: authHeaders() })
+      .then((r) => {
+        if (r.status === 401 || r.status === 403) {
+          setMacAccessDenied(true);
+          return null;
+        }
+        return r.ok ? r.json() : null;
+      })
       .then(async (d) => {
         if (!d?.last_persona) return;
         setCurrentMode(d.last_persona);
@@ -434,8 +598,12 @@ function ConfigPageInner() {
   useEffect(() => {
     if (!mac) return;
     setLoading(true);
-    fetch(`/api/config/${encodeURIComponent(mac)}`)
+    fetch(`/api/config/${encodeURIComponent(mac)}`, { headers: authHeaders() })
       .then((r) => {
+        if (r.status === 401 || r.status === 403) {
+          setMacAccessDenied(true);
+          throw new Error("Forbidden");
+        }
         if (!r.ok) throw new Error("No config");
         return r.json();
       })
@@ -563,14 +731,9 @@ function ConfigPageInner() {
     return true;
   }, [modeSchemaMap, settingsJsonDrafts, showToast, updateModeOverride]);
 
-  const handleCloseModeSettings = useCallback(() => {
-    if (!settingsMode) return;
-    if (!applySettingsDrafts(settingsMode)) return;
-    setSettingsMode(null);
-  }, [applySettingsDrafts, settingsMode]);
-
   const handleSave = async () => {
     if (!mac) { showToast("请先完成刷机和配网以获取设备 MAC", "error"); return; }
+    if (macAccessDenied) { showToast("你无权配置该设备", "error"); return; }
     setSaving(true);
     try {
       const normalizedModeOverrides = Object.fromEntries(
@@ -601,13 +764,13 @@ function ConfigPageInner() {
       if (imageApiKey.trim()) body.imageApiKey = imageApiKey.trim();
       const res = await fetch("/api/config", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify(body),
       });
       if (!res.ok) throw new Error("Save failed");
       let onlineNow = isOnline;
       try {
-        const stateRes = await fetch(`/api/device/${encodeURIComponent(mac)}/state`, { cache: "no-store" });
+        const stateRes = await fetch(`/api/device/${encodeURIComponent(mac)}/state`, { cache: "no-store", headers: authHeaders() });
         if (stateRes.ok) {
           const stateData = await stateRes.json();
           onlineNow = Boolean(stateData?.is_online);
@@ -683,26 +846,10 @@ function ConfigPageInner() {
     }
   };
 
-  const handleRefreshDevice = async () => {
-    if (!mac) return;
-    try {
-      await fetch(`/api/device/${encodeURIComponent(mac)}/refresh`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-      showToast("已触发刷新", "success");
-    } catch { showToast("刷新失败", "error"); }
-  };
-
-  const handleFavorite = async () => {
-    if (!mac) return;
-    try {
-      await fetch(`/api/device/${encodeURIComponent(mac)}/favorite`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-      showToast("已收藏", "success");
-    } catch { showToast("收藏失败", "error"); }
-  };
-
   const loadStats = useCallback(async () => {
     if (!mac) return;
     try {
-      const res = await fetch(`/api/stats/${encodeURIComponent(mac)}`);
+      const res = await fetch(`/api/stats/${encodeURIComponent(mac)}`, { headers: authHeaders() });
       if (res.ok) setStats(await res.json());
     } catch {}
   }, [mac]);
@@ -711,7 +858,11 @@ function ConfigPageInner() {
     if (!mac) return;
     if (!force && favoritesLoadedMacRef.current === mac) return;
     try {
-      const res = await fetch(`/api/device/${encodeURIComponent(mac)}/favorites?limit=100`);
+      const res = await fetch(`/api/device/${encodeURIComponent(mac)}/favorites?limit=100`, { headers: authHeaders() });
+      if (res.status === 401 || res.status === 403) {
+        setMacAccessDenied(true);
+        return;
+      }
       if (!res.ok) return;
       const data = await res.json();
       const modes = new Set<string>(
@@ -727,7 +878,11 @@ function ConfigPageInner() {
   const loadRuntimeMode = useCallback(async () => {
     if (!mac) return;
     try {
-      const res = await fetch(`/api/device/${encodeURIComponent(mac)}/state`, { cache: "no-store" });
+      const res = await fetch(`/api/device/${encodeURIComponent(mac)}/state`, { cache: "no-store", headers: authHeaders() });
+      if (res.status === 401 || res.status === 403) {
+        setMacAccessDenied(true);
+        return;
+      }
       if (!res.ok) return;
       const data = await res.json();
       setIsOnline(Boolean(data?.is_online));
@@ -817,7 +972,7 @@ function ConfigPageInner() {
     if (!mac || !customPreviewImg) return;
     setCustomApplyToScreenLoading(true);
     try {
-      const stateRes = await fetch(`/api/device/${encodeURIComponent(mac)}/state`, { cache: "no-store" });
+      const stateRes = await fetch(`/api/device/${encodeURIComponent(mac)}/state`, { cache: "no-store", headers: authHeaders() });
       if (!stateRes.ok) {
         showToast("无法确认设备状态，已阻止发送", "error");
         return;
@@ -850,7 +1005,7 @@ function ConfigPageInner() {
       qs.set("mode", modeHint);
       const res = await fetch(`/api/device/${encodeURIComponent(mac)}/apply-preview?${qs.toString()}`, {
         method: "POST",
-        headers: { "Content-Type": "image/png" },
+        headers: authHeaders({ "Content-Type": "image/png" }),
         body: previewBlob,
       });
       if (!res.ok) throw new Error("apply-preview failed");
@@ -941,7 +1096,7 @@ function ConfigPageInner() {
     if (!mac || !previewMode || !previewImg) return;
     setApplyToScreenLoading(true);
     try {
-      const stateRes = await fetch(`/api/device/${encodeURIComponent(mac)}/state`, { cache: "no-store" });
+      const stateRes = await fetch(`/api/device/${encodeURIComponent(mac)}/state`, { cache: "no-store", headers: authHeaders() });
       if (!stateRes.ok) {
         showToast("无法确认设备状态，已阻止发送", "error");
         return;
@@ -964,7 +1119,7 @@ function ConfigPageInner() {
       qs.set("mode", previewMode);
       const res = await fetch(`/api/device/${encodeURIComponent(mac)}/apply-preview?${qs.toString()}`, {
         method: "POST",
-        headers: { "Content-Type": "image/png" },
+        headers: authHeaders({ "Content-Type": "image/png" }),
         body: previewBlob,
       });
       if (!res.ok) throw new Error("apply-preview failed");
@@ -989,7 +1144,7 @@ function ConfigPageInner() {
       try {
         await fetch(`/api/device/${encodeURIComponent(mac)}/favorite`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: authHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({ mode: m }),
         });
         await loadFavorites(true);
@@ -1048,6 +1203,9 @@ function ConfigPageInner() {
   const batteryPct = stats?.last_battery_voltage
     ? Math.min(100, Math.max(0, Math.round((stats.last_battery_voltage / 3.3) * 100)))
     : null;
+  const currentDeviceMembership = userDevices.find((d) => d.mac.toUpperCase() === mac.toUpperCase()) || null;
+  const denyByMembership = Boolean(mac && currentUser && !devicesLoading && !currentDeviceMembership);
+  const currentUserRole = currentDeviceMembership?.role || "";
   const statusLabel = !isOnline ? "离线" : runtimeMode === "active" ? "活跃状态" : "间歇状态";
   const statusClass = !isOnline
     ? "bg-paper-dark text-ink-light border border-ink/10"
@@ -1080,10 +1238,26 @@ function ConfigPageInner() {
               </Link>
             </div>
           </div>
+        ) : (macAccessDenied || denyByMembership) ? (
+          <div className="flex items-start gap-2 p-3 rounded-sm border border-red-200 bg-red-50 text-sm text-red-800">
+            <AlertCircle size={16} className="mt-0.5 flex-shrink-0" />
+            <div>
+              <p className="font-medium">无权访问该设备</p>
+              <p className="text-xs mt-0.5">该设备未绑定到当前账号，或你不是被授权成员。</p>
+              <Link href="/config">
+                <Button size="sm" variant="outline" className="mt-2">返回设备列表</Button>
+              </Link>
+            </div>
+          </div>
         ) : mac ? (
           <p className="text-ink-light text-sm flex items-center gap-2">
             <CheckCircle2 size={14} className={statusIconClass} />
             设备 MAC: <code className="bg-paper-dark px-2 py-0.5 rounded text-xs">{mac}</code>
+            {currentUserRole && (
+              <span className="inline-flex items-center rounded px-2 py-0.5 text-xs bg-paper-dark text-ink">
+                {currentUserRole === "owner" ? "Owner" : "Member"}
+              </span>
+            )}
             <span className={`ml-1 inline-flex items-center rounded px-2 py-0.5 text-xs ${statusClass}`}>{statusLabel}</span>
             {lastSeen && (
               <span className="text-xs text-ink-light">
@@ -1096,6 +1270,42 @@ function ConfigPageInner() {
           </p>
         ) : (
           <div className="space-y-4">
+            {requestsLoading ? (
+              <div className="flex items-center gap-2 text-ink-light text-sm py-2">
+                <Loader2 size={16} className="animate-spin" /> 加载待处理请求...
+              </div>
+            ) : pendingRequests.length > 0 ? (
+              <div className="p-3 rounded-sm border border-amber-200 bg-amber-50">
+                <p className="text-sm font-medium text-amber-900 mb-2">待你处理的绑定请求</p>
+                <div className="space-y-2">
+                  {pendingRequests.map((item) => (
+                    <div key={item.id} className="flex items-center justify-between gap-3 text-sm">
+                      <div>
+                        <p className="font-medium text-amber-900">{item.requester_username}</p>
+                        <p className="text-xs text-amber-800 font-mono">{item.mac}</p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Button size="sm" variant="outline" onClick={() => handleRejectRequest(item.id)}>拒绝</Button>
+                        <Button size="sm" onClick={() => handleApproveRequest(item.id)}>同意</Button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
+            <div className="p-3 rounded-sm border border-ink/10 bg-paper">
+              <p className="text-sm font-medium text-ink mb-2 flex items-center gap-1">
+                <Monitor size={14} /> 检测设备
+              </p>
+              <div className="mt-2">
+                <Button size="sm" variant="outline" onClick={handleDetectDevice} disabled={detectingDevice}>
+                  {detectingDevice ? <Loader2 size={14} className="animate-spin mr-1" /> : null}
+                  检测设备
+                </Button>
+              </div>
+            </div>
+
             {/* Device list */}
             {devicesLoading ? (
               <div className="flex items-center gap-2 text-ink-light text-sm py-4">
@@ -1114,6 +1324,9 @@ function ConfigPageInner() {
                         {d.nickname && (
                           <p className="text-xs text-ink-light font-mono">{d.mac}</p>
                         )}
+                        <p className="text-xs text-ink-light">
+                          权限: {d.role === "owner" ? "Owner" : "Member"}
+                        </p>
                         <p className="text-xs text-ink-light">
                           {d.last_seen
                             ? `上次在线: ${new Date(d.last_seen).toLocaleString("zh-CN")}`
@@ -1143,24 +1356,44 @@ function ConfigPageInner() {
                 <AlertCircle size={16} className="mt-0.5 flex-shrink-0" />
                 <div>
                   <p className="font-medium">未绑定设备</p>
-                  <p className="text-xs mt-0.5">完成刷机和配网后，设备将自动出现在此处。</p>
-                  <p className="text-xs mt-1.5 animate-pulse">正在等待设备联网...（配网完成后将自动检测）</p>
+                  <p className="text-xs mt-0.5">当前账号下还没有设备。</p>
                 </div>
               </div>
             )}
 
-            {/* Discovered device banner */}
-            {discoveredDevice && !userDevices.some((d) => d.mac === discoveredDevice) && (
-              <div className="flex items-start gap-2 p-3 rounded-sm border border-green-200 bg-green-50 text-sm text-green-800">
-                <CheckCircle2 size={16} className="mt-0.5 flex-shrink-0" />
-                <div>
-                  <p className="font-medium">已检测到新设备上线: {discoveredDevice}</p>
-                  <Button size="sm" className="mt-2" onClick={() => {
-                    window.location.href = `/config?mac=${encodeURIComponent(discoveredDevice)}`;
-                  }}>
-                    进入配置
-                  </Button>
-                </div>
+            {discoveredDevices.length > 0 && (
+              <div className="space-y-2">
+                {discoveredDevices.map((device) => (
+                  <div key={device.mac} className="flex items-start gap-2 p-3 rounded-sm border border-green-200 bg-green-50 text-sm text-green-800">
+                    <CheckCircle2 size={16} className="mt-0.5 flex-shrink-0" />
+                    <div className="flex-1">
+                      <p className="font-medium">已检测到设备上线: {device.mac}</p>
+                      <p className="text-xs mt-1">
+                        {device.has_owner ? "该设备已有 owner，可申请绑定并等待对方同意。" : "该设备当前没有 owner，可直接绑定。"}
+                      </p>
+                      {device.last_seen && (
+                        <p className="text-xs mt-1">最近上报: {new Date(device.last_seen).toLocaleString("zh-CN")}</p>
+                      )}
+                      <div className="mt-2 flex items-center gap-2">
+                        <Button size="sm" onClick={() => {
+                          handleBindDevice(device.mac).then((result) => {
+                            if (!result) {
+                              showToast(device.has_owner ? "申请绑定失败" : "绑定失败", "error");
+                              return;
+                            }
+                            if (result.status === "claimed" || result.status === "active") {
+                              window.location.href = `/config?mac=${encodeURIComponent(device.mac)}`;
+                              return;
+                            }
+                            showToast("已提交绑定申请，等待 owner 同意", "info");
+                          });
+                        }}>
+                          {device.has_owner ? "申请绑定" : "直接绑定"}
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
               </div>
             )}
 
@@ -1184,9 +1417,14 @@ function ConfigPageInner() {
                 />
                 <Button size="sm" onClick={async () => {
                   if (!bindMacInput.trim()) return;
-                  const ok = await handleBindDevice(bindMacInput.trim(), bindNicknameInput.trim());
-                  if (!ok) showToast("绑定失败（设备已绑定或 MAC 无效）", "error");
-                  else showToast("设备已绑定", "success");
+                  const result = await handleBindDevice(bindMacInput.trim(), bindNicknameInput.trim());
+                  if (!result) {
+                    showToast("绑定失败（MAC 无效或设备不可用）", "error");
+                  } else if (result.status === "claimed" || result.status === "active") {
+                    showToast("设备已绑定", "success");
+                  } else if (result.status === "pending_approval") {
+                    showToast("已提交绑定申请，等待 owner 同意", "info");
+                  }
                 }}>
                   绑定
                 </Button>
@@ -1196,16 +1434,80 @@ function ConfigPageInner() {
         )}
       </div>
 
-      {mac && currentUser && loading && (
+      {mac && currentUser && !(macAccessDenied || denyByMembership) && loading && (
         <div className="flex items-center justify-center py-20 text-ink-light">
           <Loader2 size={24} className="animate-spin mr-2" /> 加载配置中...
         </div>
       )}
 
-      {mac && currentUser && !loading && (
-        <div className="flex gap-6">
-          {/* Sidebar tabs */}
-          <nav className="w-44 flex-shrink-0 hidden md:block">
+      {mac && currentUser && !(macAccessDenied || denyByMembership) && !loading && (
+        <div className="space-y-4">
+          {(currentUserRole === "owner" || pendingRequests.some((item) => item.mac === mac)) && (
+            <div className="grid gap-4 md:grid-cols-2">
+              {currentUserRole === "owner" && (
+                <Card>
+                  <CardHeader><CardTitle className="text-base">共享成员</CardTitle></CardHeader>
+                  <CardContent className="space-y-3">
+                    <div className="flex gap-2">
+                      <input
+                        value={shareUsernameInput}
+                        onChange={(e) => setShareUsernameInput(e.target.value)}
+                        placeholder="输入要共享的用户名"
+                        className="flex-1 rounded-sm border border-ink/20 px-3 py-2 text-sm"
+                      />
+                      <Button variant="outline" size="sm" onClick={handleShareDevice} disabled={!shareUsernameInput.trim()}>
+                        分享
+                      </Button>
+                    </div>
+                    {membersLoading ? (
+                      <div className="flex items-center gap-2 text-sm text-ink-light">
+                        <Loader2 size={14} className="animate-spin" /> 加载成员中...
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        {deviceMembers.map((member) => (
+                          <div key={member.user_id} className="flex items-center justify-between rounded-sm border border-ink/10 p-2 text-sm">
+                            <div>
+                              <p className="font-medium text-ink">{member.username}</p>
+                              <p className="text-xs text-ink-light">{member.role === "owner" ? "Owner" : "Member"}</p>
+                            </div>
+                            {member.role !== "owner" && (
+                              <Button variant="outline" size="sm" onClick={() => handleRemoveMember(member.user_id)}>
+                                移除
+                              </Button>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+              )}
+              {pendingRequests.some((item) => item.mac === mac) && (
+                <Card>
+                  <CardHeader><CardTitle className="text-base">待处理绑定请求</CardTitle></CardHeader>
+                  <CardContent className="space-y-2">
+                    {pendingRequests.filter((item) => item.mac === mac).map((item) => (
+                      <div key={item.id} className="flex items-center justify-between gap-2 rounded-sm border border-ink/10 p-2 text-sm">
+                        <div>
+                          <p className="font-medium text-ink">{item.requester_username}</p>
+                          <p className="text-xs text-ink-light">请求绑定此设备</p>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <Button variant="outline" size="sm" onClick={() => handleRejectRequest(item.id)}>拒绝</Button>
+                          <Button size="sm" onClick={() => handleApproveRequest(item.id)}>同意</Button>
+                        </div>
+                      </div>
+                    ))}
+                  </CardContent>
+                </Card>
+              )}
+            </div>
+          )}
+
+          <div className="flex gap-6">
+            {/* Sidebar tabs */}
+            <nav className="w-44 flex-shrink-0 hidden md:block">
             <div className="sticky top-24 space-y-1">
               {TABS.map((tab) => (
                 <button
@@ -1235,8 +1537,8 @@ function ConfigPageInner() {
             </div>
           </nav>
 
-          {/* Mobile tabs */}
-          <div className="md:hidden w-full mb-4 overflow-x-auto">
+            {/* Mobile tabs */}
+            <div className="md:hidden w-full mb-4 overflow-x-auto">
             <div className="flex gap-1 min-w-max pb-2">
               {TABS.map((tab) => (
                 <button
@@ -1252,8 +1554,8 @@ function ConfigPageInner() {
             </div>
           </div>
 
-          {/* Content */}
-          <div className="flex-1 min-w-0">
+            {/* Content */}
+            <div className="flex-1 min-w-0">
             {/* Modes Tab */}
             {activeTab === "modes" && (
               <div className="space-y-6">
@@ -1262,13 +1564,13 @@ function ConfigPageInner() {
                   <CardContent>
                     <ModeGrid
                       title="核心模式" modes={CORE_MODES}
-                      selectedModes={selectedModes} currentMode={currentMode} favoritedModes={favoritedModes}
+                      selectedModes={selectedModes} favoritedModes={favoritedModes}
                       onPreview={handleModePreview} onApply={handleModeApply} onFavorite={handleModeFavorite}
                       onSettings={(m) => setSettingsMode(m)}
                     />
                     <ModeGrid
                       title="更多模式" modes={EXTRA_MODES} collapsible
-                      selectedModes={selectedModes} currentMode={currentMode} favoritedModes={favoritedModes}
+                      selectedModes={selectedModes} favoritedModes={favoritedModes}
                       onPreview={handleModePreview} onApply={handleModeApply} onFavorite={handleModeFavorite}
                       onSettings={(m) => setSettingsMode(m)}
                     />
@@ -1276,7 +1578,6 @@ function ConfigPageInner() {
                       title="自定义模式"
                       modes={customModes.map((cm) => cm.mode_id)}
                       selectedModes={selectedModes}
-                      currentMode={currentMode}
                       favoritedModes={favoritedModes}
                       onPreview={handleModePreview}
                       onApply={handleModeApply}
@@ -1933,6 +2234,7 @@ function ConfigPageInner() {
               </Card>
             </div>
           )}
+          </div>
         </div>
       )}
 
@@ -1969,7 +2271,6 @@ function ModeGrid({
   title,
   modes,
   selectedModes,
-  currentMode,
   favoritedModes,
   onPreview,
   onApply,
@@ -1982,7 +2283,6 @@ function ModeGrid({
   title: string;
   modes: string[];
   selectedModes: Set<string>;
-  currentMode: string;
   favoritedModes: Set<string>;
   onPreview: (m: string) => void;
   onApply: (m: string) => void;
@@ -2011,7 +2311,6 @@ function ModeGrid({
           {modes.map((m) => {
             const meta = customMeta?.[m] || MODE_META[m] || { name: m, tip: "" };
             const isSelected = selectedModes.has(m);
-            const isCurrent = currentMode === m;
             const isFavorited = favoritedModes.has(m);
             const sel = isSelected;
             const isOpen = openMode === m;

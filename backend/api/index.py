@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import io
+import json
 import logging
 import os
 import random
@@ -13,7 +14,7 @@ from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 from typing import Optional
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query, Request, Response, Depends, Header
+from fastapi import FastAPI, Query, Request, Response, Depends, Header, HTTPException, Cookie
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 # slowapi (rate limiting) is optional at runtime. In environments where it is
@@ -59,6 +60,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+DISCOVERY_WINDOW_MINUTES = 15
+ONLINE_WINDOW_MINUTES = 15
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
@@ -90,6 +93,17 @@ from core.config_store import (
     bind_device,
     unbind_device,
     get_user_devices,
+    get_device_membership,
+    get_device_owner,
+    get_device_members,
+    get_pending_requests_for_owner,
+    approve_access_request,
+    reject_access_request,
+    share_device_with_user,
+    revoke_device_member,
+    get_user_by_username,
+    create_claim_token,
+    consume_claim_token,
 )
 from core.cache import content_cache
 from core.schemas import ConfigRequest
@@ -127,6 +141,7 @@ from core.auth import (
     decode_session_token,
     set_session_cookie,
     clear_session_cookie,
+    is_admin_authorized,
 )
 
 
@@ -142,6 +157,46 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="InkSight API", version="1.0.0", lifespan=lifespan)
+
+
+async def _resolve_user_id(request: Request, ink_session: Optional[str]) -> int | None:
+    return await optional_user(request, ink_session)
+
+
+async def _require_membership_access(
+    request: Request,
+    mac: str,
+    ink_session: Optional[str],
+    *,
+    owner_only: bool = False,
+) -> dict:
+    mac = validate_mac_param(mac)
+    user_id = await _resolve_user_id(request, ink_session)
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="请先登录")
+    membership = await get_device_membership(mac, user_id)
+    if not membership:
+        raise HTTPException(status_code=403, detail="无设备访问权限")
+    if owner_only and membership.get("role") != "owner":
+        raise HTTPException(status_code=403, detail="仅 owner 可执行此操作")
+    return membership
+
+
+async def _ensure_web_or_device_access(
+    request: Request,
+    mac: str,
+    x_device_token: Optional[str],
+    ink_session: Optional[str],
+    *,
+    owner_only: bool = False,
+    allow_device_token: bool = True,
+) -> dict:
+    mac = validate_mac_param(mac)
+    if allow_device_token and x_device_token:
+        await require_device_token(mac, x_device_token)
+        return {"mode": "device", "role": "device"}
+    membership = await _require_membership_access(request, mac, ink_session, owner_only=owner_only)
+    return {"mode": "user", **membership}
 
 # ── Rate limiting ────────────────────────────────────────────
 
@@ -831,9 +886,12 @@ async def preview(
     w: int = Query(default=SCREEN_WIDTH, ge=100, le=1600, description="Screen width in pixels"),
     h: int = Query(default=SCREEN_HEIGHT, ge=100, le=1200, description="Screen height in pixels"),
     no_cache: Optional[int] = Query(default=None, description="1 = bypass cache for this preview"),
+    x_device_token: Optional[str] = Header(default=None),
+    ink_session: Optional[str] = Cookie(default=None),
 ):
     if mac:
         mac = validate_mac_param(mac)
+        await _ensure_web_or_device_access(request, mac, x_device_token, ink_session)
     try:
         effective_v = await _resolve_preview_voltage(v, mac)
         parsed_mode_override = None
@@ -874,12 +932,23 @@ async def preview(
 
 @app.post("/api/config")
 async def post_config(
+    request: Request,
     body: ConfigRequest,
     x_inksight_client: Optional[str] = Header(default=None),
-    admin_auth: None = Depends(require_admin),
+    x_device_token: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    ink_session: Optional[str] = Cookie(default=None),
 ):
     data = body.model_dump()
     mac = data["mac"]
+    if not is_admin_authorized(authorization):
+        await _ensure_web_or_device_access(
+            request,
+            mac,
+            x_device_token,
+            ink_session,
+            allow_device_token=True,
+        )
     modes = data.get("modes", [])
     logger.info(
         f"[CONFIG SAVE REQUEST] source={x_inksight_client or 'unknown'} "
@@ -900,8 +969,13 @@ async def post_config(
 
 
 @app.get("/api/config/{mac}")
-async def get_config(mac: str, x_device_token: Optional[str] = Header(default=None)):
-    await require_device_token(mac, x_device_token)
+async def get_config(
+    mac: str,
+    request: Request,
+    x_device_token: Optional[str] = Header(default=None),
+    ink_session: Optional[str] = Cookie(default=None),
+):
+    await _ensure_web_or_device_access(request, mac, x_device_token, ink_session)
     config = await get_active_config(mac)
     if not config:
         return JSONResponse({"error": "no config found"}, status_code=404)
@@ -912,8 +986,13 @@ async def get_config(mac: str, x_device_token: Optional[str] = Header(default=No
 
 
 @app.get("/api/config/{mac}/history")
-async def get_config_hist(mac: str, x_device_token: Optional[str] = Header(default=None)):
-    await require_device_token(mac, x_device_token)
+async def get_config_hist(
+    mac: str,
+    request: Request,
+    x_device_token: Optional[str] = Header(default=None),
+    ink_session: Optional[str] = Cookie(default=None),
+):
+    await _ensure_web_or_device_access(request, mac, x_device_token, ink_session)
     history = await get_config_history(mac)
     # Strip encrypted keys from API response
     for cfg in history:
@@ -1236,19 +1315,29 @@ def _load_web_page_html(filename: str) -> str:
 
 
 @app.post("/api/device/{mac}/refresh")
-async def trigger_refresh(mac: str, x_device_token: Optional[str] = Header(default=None)):
+async def trigger_refresh(
+    mac: str,
+    request: Request,
+    x_device_token: Optional[str] = Header(default=None),
+    ink_session: Optional[str] = Cookie(default=None),
+):
     """Mark a device for immediate refresh on next wake-up."""
-    await require_device_token(mac, x_device_token)
+    await _ensure_web_or_device_access(request, mac, x_device_token, ink_session)
     await set_pending_refresh(mac, True)
     logger.info(f"[DEVICE] Pending refresh set for {mac}")
     return {"ok": True, "message": "Refresh queued for next wake-up"}
 
 
 @app.get("/api/device/{mac}/state")
-async def device_state(mac: str, x_device_token: Optional[str] = Header(default=None)):
+async def device_state(
+    mac: str,
+    request: Request,
+    x_device_token: Optional[str] = Header(default=None),
+    ink_session: Optional[str] = Cookie(default=None),
+):
     """Get device runtime state."""
-    await require_device_token(mac, x_device_token)
-    if x_device_token:
+    access = await _ensure_web_or_device_access(request, mac, x_device_token, ink_session)
+    if access["mode"] == "device":
         await update_device_state(mac, last_state_poll_at=datetime.now().isoformat())
     state = await get_device_state(mac)
     if not state:
@@ -1262,7 +1351,7 @@ async def device_state(mac: str, x_device_token: Optional[str] = Header(default=
     if isinstance(last_seen, str) and last_seen:
         try:
             delta_seconds = (datetime.now() - datetime.fromisoformat(last_seen)).total_seconds()
-            is_online = delta_seconds <= (refresh_minutes * 60)
+            is_online = delta_seconds <= (ONLINE_WINDOW_MINUTES * 60)
         except Exception:
             is_online = False
     state["last_seen"] = last_seen
@@ -1295,6 +1384,7 @@ async def device_state(mac: str, x_device_token: Optional[str] = Header(default=
 @app.post("/api/device/{mac}/runtime")
 async def set_runtime_mode(mac: str, body: dict, x_device_token: Optional[str] = Header(default=None)):
     """Update device runtime mode (active/interval)."""
+    mac = validate_mac_param(mac)
     await require_device_token(mac, x_device_token)
     mode = str(body.get("mode", "")).strip().lower()
     if mode not in ("active", "interval"):
@@ -1303,15 +1393,34 @@ async def set_runtime_mode(mac: str, body: dict, x_device_token: Optional[str] =
     return {"ok": True, "runtime_mode": mode}
 
 
+@app.post("/api/device/{mac}/heartbeat")
+async def post_device_heartbeat(mac: str, body: dict, x_device_token: Optional[str] = Header(default=None)):
+    mac = validate_mac_param(mac)
+    await require_device_token(mac, x_device_token)
+    battery_voltage = body.get("battery_voltage")
+    wifi_rssi = body.get("wifi_rssi")
+    try:
+        voltage = float(battery_voltage) if battery_voltage is not None else 3.3
+    except Exception:
+        voltage = 3.3
+    try:
+        rssi = int(wifi_rssi) if wifi_rssi is not None else None
+    except Exception:
+        rssi = None
+    await log_heartbeat(mac, voltage, rssi)
+    return {"ok": True}
+
+
 @app.post("/api/device/{mac}/apply-preview")
 async def apply_preview_to_device(
     mac: str,
     request: Request,
     mode: str = Query(default="", description="Optional mode hint for logs/state"),
     x_device_token: Optional[str] = Header(default=None),
+    ink_session: Optional[str] = Cookie(default=None),
 ):
     """Queue a one-shot preview image to be sent by /api/render."""
-    await require_device_token(mac, x_device_token)
+    await _ensure_web_or_device_access(request, mac, x_device_token, ink_session)
     body = await request.body()
     if not body:
         return JSONResponse({"error": "empty image payload"}, status_code=400)
@@ -1337,9 +1446,15 @@ async def apply_preview_to_device(
 
 
 @app.post("/api/device/{mac}/switch")
-async def switch_mode(mac: str, body: dict, x_device_token: Optional[str] = Header(default=None)):
+async def switch_mode(
+    mac: str,
+    body: dict,
+    request: Request,
+    x_device_token: Optional[str] = Header(default=None),
+    ink_session: Optional[str] = Cookie(default=None),
+):
     """Set a pending mode for the device to use on next refresh."""
-    await require_device_token(mac, x_device_token)
+    await _ensure_web_or_device_access(request, mac, x_device_token, ink_session)
     mode = body.get("mode", "").upper()
     registry = get_registry()
     if not mode or not registry.is_supported(mode):
@@ -1352,11 +1467,13 @@ async def switch_mode(mac: str, body: dict, x_device_token: Optional[str] = Head
 @app.post("/api/device/{mac}/favorite")
 async def favorite_content(
     mac: str,
+    request: Request,
     body: Optional[dict] = None,
     x_device_token: Optional[str] = Header(default=None),
+    ink_session: Optional[str] = Cookie(default=None),
 ):
     """Favorite the most recently rendered content for this device."""
-    await require_device_token(mac, x_device_token)
+    await _ensure_web_or_device_access(request, mac, x_device_token, ink_session)
     mode = ""
     if isinstance(body, dict):
         mode = str(body.get("mode", "")).strip().upper()
@@ -1388,11 +1505,13 @@ async def favorite_content(
 @app.get("/api/device/{mac}/favorites")
 async def list_favorites(
     mac: str,
+    request: Request,
     limit: int = Query(default=30, ge=1, le=100),
     x_device_token: Optional[str] = Header(default=None),
+    ink_session: Optional[str] = Cookie(default=None),
 ):
     """Get favorites for a device."""
-    await require_device_token(mac, x_device_token)
+    await _ensure_web_or_device_access(request, mac, x_device_token, ink_session)
     favorites = await get_favorites(mac, limit)
     return {"mac": mac, "favorites": favorites}
 
@@ -1400,21 +1519,29 @@ async def list_favorites(
 @app.get("/api/device/{mac}/history")
 async def content_history(
     mac: str,
+    request: Request,
     limit: int = Query(default=30, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     mode: Optional[str] = Query(default=None, description="Filter by mode"),
     x_device_token: Optional[str] = Header(default=None),
+    ink_session: Optional[str] = Cookie(default=None),
 ):
     """Get content history for a device."""
-    await require_device_token(mac, x_device_token)
+    await _ensure_web_or_device_access(request, mac, x_device_token, ink_session)
     history = await get_content_history(mac, limit, offset, mode)
     return {"mac": mac, "history": history}
 
 
 @app.post("/api/device/{mac}/habit/check")
-async def habit_check(mac: str, body: dict, x_device_token: Optional[str] = Header(default=None)):
+async def habit_check(
+    mac: str,
+    body: dict,
+    request: Request,
+    x_device_token: Optional[str] = Header(default=None),
+    ink_session: Optional[str] = Cookie(default=None),
+):
     """Record a habit check."""
-    await require_device_token(mac, x_device_token)
+    await _ensure_web_or_device_access(request, mac, x_device_token, ink_session)
     habit_name = body.get("habit", "").strip()
     if not habit_name:
         return JSONResponse({"error": "habit name is required"}, status_code=400)
@@ -1424,17 +1551,28 @@ async def habit_check(mac: str, body: dict, x_device_token: Optional[str] = Head
 
 
 @app.get("/api/device/{mac}/habit/status")
-async def habit_status(mac: str, x_device_token: Optional[str] = Header(default=None)):
+async def habit_status(
+    mac: str,
+    request: Request,
+    x_device_token: Optional[str] = Header(default=None),
+    ink_session: Optional[str] = Cookie(default=None),
+):
     """Get habit status for the current week."""
-    await require_device_token(mac, x_device_token)
+    await _ensure_web_or_device_access(request, mac, x_device_token, ink_session)
     habits = await get_habit_status(mac)
     return {"mac": mac, "habits": habits}
 
 
 @app.delete("/api/device/{mac}/habit/{habit_name}")
-async def habit_delete(mac: str, habit_name: str, x_device_token: Optional[str] = Header(default=None)):
+async def habit_delete(
+    mac: str,
+    habit_name: str,
+    request: Request,
+    x_device_token: Optional[str] = Header(default=None),
+    ink_session: Optional[str] = Cookie(default=None),
+):
     """Delete a habit and all its records."""
-    await require_device_token(mac, x_device_token)
+    await _ensure_web_or_device_access(request, mac, x_device_token, ink_session)
     deleted = await delete_habit(mac, habit_name)
     if not deleted:
         return JSONResponse({"error": "Habit not found"}, status_code=404)
@@ -1443,6 +1581,7 @@ async def habit_delete(mac: str, habit_name: str, x_device_token: Optional[str] 
 
 @app.post("/api/device/{mac}/token")
 async def provision_device_token(mac: str):
+    mac = validate_mac_param(mac)
     """分发或获取设备 Token。
 
     - 新设备（无状态）：生成并返回新 Token
@@ -1457,28 +1596,64 @@ async def provision_device_token(mac: str):
     return {"token": token, "new": True}
 
 
+@app.post("/api/device/{mac}/claim-token")
+async def provision_claim_token(
+    mac: str,
+    x_device_token: Optional[str] = Header(default=None),
+):
+    mac = validate_mac_param(mac)
+    await require_device_token(mac, x_device_token)
+    created = await create_claim_token(mac, source="portal")
+    return {
+        "ok": True,
+        "token": created["token"],
+        "claim_url": f"https://www.inksight.site/claim?token={created['token']}",
+        "expires_at": created["expires_at"],
+    }
+
+
+@app.post("/api/claim/consume")
+async def claim_consume(body: dict, user_id: int = Depends(require_user)):
+    token = str(body.get("token") or "").strip()
+    if not token:
+        return JSONResponse({"error": "token 不能为空"}, status_code=400)
+    result = await consume_claim_token(token, user_id)
+    if result["status"] == "invalid":
+        return JSONResponse({"error": "claim token 无效"}, status_code=404)
+    if result["status"] == "expired":
+        return JSONResponse({"error": "claim token 已失效"}, status_code=410)
+    return {"ok": True, **result}
+
+
 # ── Device discovery (public, no auth) ────────────────────────
 
 
 @app.get("/api/devices/recent")
-async def recent_devices(minutes: int = Query(default=10, ge=1, le=60)):
+async def recent_devices(minutes: int = Query(default=DISCOVERY_WINDOW_MINUTES, ge=1, le=60)):
     """Return MACs seen in the last N minutes (for post-flash discovery)."""
-    import aiosqlite
     from datetime import datetime, timedelta
-    from core.stats_store import DB_PATH
+    from core.db import get_main_db
     cutoff = (datetime.now() - timedelta(minutes=minutes)).isoformat()
     logger.info(f"[DISCOVERY] recent_devices requested: minutes={minutes}, cutoff={cutoff}")
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            """SELECT DISTINCT mac, MAX(created_at) as last_seen
+    db = await get_main_db()
+    cursor = await db.execute(
+        """WITH recent AS (
+               SELECT mac, MAX(created_at) AS last_seen
                FROM device_heartbeats
                WHERE created_at > ?
                GROUP BY mac
-               ORDER BY last_seen DESC""",
-            (cutoff,),
-        )
-        rows = await cursor.fetchall()
-    devices = [{"mac": r[0], "last_seen": r[1]} for r in rows if r and r[0]]
+           )
+           SELECT recent.mac,
+                  recent.last_seen,
+                  CASE WHEN owner.user_id IS NULL THEN 0 ELSE 1 END AS has_owner
+           FROM recent
+           LEFT JOIN device_memberships owner
+             ON owner.mac = recent.mac AND owner.role = 'owner' AND owner.status = 'active'
+           ORDER BY recent.last_seen DESC""",
+        (cutoff,),
+    )
+    rows = await cursor.fetchall()
+    devices = [{"mac": r[0], "last_seen": r[1], "has_owner": bool(r[2])} for r in rows if r and r[0]]
     macs = [d["mac"] for d in devices]
     logger.info(f"[DISCOVERY] recent_devices result: count={len(devices)}, macs={macs}")
     return {"devices": devices}
@@ -1543,21 +1718,85 @@ async def list_user_devices(user_id: int = Depends(require_user)):
 
 @app.post("/api/user/devices")
 async def bind_user_device(body: dict, user_id: int = Depends(require_user)):
-    mac = (body.get("mac") or "").strip().upper()
+    mac = validate_mac_param((body.get("mac") or "").strip().upper())
     nickname = (body.get("nickname") or "").strip()
     if not mac:
         return JSONResponse({"error": "MAC 地址不能为空"}, status_code=400)
-    ok = await bind_device(user_id, mac, nickname)
-    if not ok:
-        return JSONResponse({"error": "设备已绑定"}, status_code=409)
-    return {"ok": True}
+    result = await bind_device(user_id, mac, nickname)
+    if result["status"] == "pending_approval":
+        return {"ok": True, **result}
+    return {"ok": True, **result}
 
 
 @app.delete("/api/user/devices/{mac:path}")
 async def unbind_user_device(mac: str, user_id: int = Depends(require_user)):
-    ok = await unbind_device(user_id, mac.upper())
-    if not ok:
+    result = await unbind_device(user_id, mac.upper())
+    if result == "not_found":
         return JSONResponse({"error": "设备未绑定"}, status_code=404)
+    if result == "owner_has_members":
+        return JSONResponse({"error": "owner 仍有共享成员，无法解绑"}, status_code=409)
+    return {"ok": True}
+
+
+@app.get("/api/user/devices/requests")
+async def list_device_requests(user_id: int = Depends(require_user)):
+    requests = await get_pending_requests_for_owner(user_id)
+    return {"requests": requests}
+
+
+@app.post("/api/user/devices/requests/{request_id}/approve")
+async def approve_device_request(request_id: int, user_id: int = Depends(require_user)):
+    membership = await approve_access_request(request_id, user_id)
+    if not membership:
+        return JSONResponse({"error": "请求不存在或无法批准"}, status_code=404)
+    return {"ok": True, "membership": membership}
+
+
+@app.post("/api/user/devices/requests/{request_id}/reject")
+async def reject_device_request(request_id: int, user_id: int = Depends(require_user)):
+    ok = await reject_access_request(request_id, user_id)
+    if not ok:
+        return JSONResponse({"error": "请求不存在或无法拒绝"}, status_code=404)
+    return {"ok": True}
+
+
+@app.get("/api/user/devices/{mac:path}/members")
+async def list_device_members(mac: str, request: Request, ink_session: Optional[str] = Cookie(default=None)):
+    await _require_membership_access(request, mac.upper(), ink_session)
+    members = await get_device_members(mac.upper())
+    owner = await get_device_owner(mac.upper())
+    return {"mac": mac.upper(), "members": members, "owner_user_id": owner["user_id"] if owner else None}
+
+
+@app.post("/api/user/devices/{mac:path}/share")
+async def share_device_access(
+    mac: str,
+    body: dict,
+    request: Request,
+    ink_session: Optional[str] = Cookie(default=None),
+):
+    owner = await _require_membership_access(request, mac.upper(), ink_session, owner_only=True)
+    username = str(body.get("username") or "").strip()
+    if not username:
+        return JSONResponse({"error": "用户名不能为空"}, status_code=400)
+    target_user = await get_user_by_username(username)
+    if not target_user:
+        return JSONResponse({"error": "目标用户不存在"}, status_code=404)
+    result = await share_device_with_user(owner["user_id"], mac.upper(), target_user["id"])
+    return {"ok": True, **result}
+
+
+@app.delete("/api/user/devices/{mac:path}/members/{target_user_id}")
+async def remove_device_member(
+    mac: str,
+    target_user_id: int,
+    request: Request,
+    ink_session: Optional[str] = Cookie(default=None),
+):
+    owner = await _require_membership_access(request, mac.upper(), ink_session, owner_only=True)
+    ok = await revoke_device_member(owner["user_id"], mac.upper(), target_user_id)
+    if not ok:
+        return JSONResponse({"error": "成员不存在或无法移除"}, status_code=404)
     return {"ok": True}
 
 
@@ -1571,21 +1810,28 @@ async def stats_overview(admin_auth: None = Depends(require_admin)):
 
 
 @app.get("/api/stats/{mac}")
-async def stats_device(mac: str, x_device_token: Optional[str] = Header(default=None)):
+async def stats_device(
+    mac: str,
+    request: Request,
+    x_device_token: Optional[str] = Header(default=None),
+    ink_session: Optional[str] = Cookie(default=None),
+):
     """Device-specific statistics."""
-    await require_device_token(mac, x_device_token)
+    await _ensure_web_or_device_access(request, mac, x_device_token, ink_session)
     return await get_device_stats(mac)
 
 
 @app.get("/api/stats/{mac}/renders")
 async def stats_renders(
     mac: str,
+    request: Request,
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     x_device_token: Optional[str] = Header(default=None),
+    ink_session: Optional[str] = Cookie(default=None),
 ):
     """Render history for a device with pagination."""
-    await require_device_token(mac, x_device_token)
+    await _ensure_web_or_device_access(request, mac, x_device_token, ink_session)
     renders = await get_render_history(mac, limit, offset)
     return {"mac": mac, "renders": renders}
 
@@ -1596,11 +1842,13 @@ async def stats_renders(
 @app.get("/api/device/{mac}/qr")
 async def device_qr(
     mac: str,
+    request: Request,
     base_url: Optional[str] = Query(default=None, description="Override base URL for remote page"),
     x_device_token: Optional[str] = Header(default=None),
+    ink_session: Optional[str] = Cookie(default=None),
 ):
     """Generate a QR code BMP for device binding (scan to open remote control)."""
-    await require_device_token(mac, x_device_token)
+    await _ensure_web_or_device_access(request, mac, x_device_token, ink_session)
     import qrcode
     from io import BytesIO
 
@@ -1626,12 +1874,14 @@ async def device_qr(
 @app.get("/api/device/{mac}/share")
 async def share_image(
     mac: str,
+    request: Request,
     w: int = Query(default=800, ge=400, le=1600),
     h: int = Query(default=450, ge=300, le=900),
     x_device_token: Optional[str] = Header(default=None),
+    ink_session: Optional[str] = Cookie(default=None),
 ):
     """Generate a shareable image (16:9) with InkSight watermark."""
-    await require_device_token(mac, x_device_token)
+    await _ensure_web_or_device_access(request, mac, x_device_token, ink_session)
     latest = await get_latest_render_content(mac)
     if not latest:
         return JSONResponse({"error": "no content to share"}, status_code=404)

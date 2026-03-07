@@ -23,6 +23,16 @@ export function authHeaders(extra?: Record<string, string>): Record<string, stri
   return h;
 }
 
+export async function fetchCurrentUser<T = { user_id: number; username: string; created_at?: string }>(): Promise<T | null> {
+  const res = await fetch("/api/auth/me", { headers: authHeaders() });
+  if (res.status === 401 || res.status === 404) {
+    if (getToken()) clearToken();
+    return null;
+  }
+  if (!res.ok) return null;
+  return res.json();
+}
+
 export function onAuthChanged(callback: () => void): () => void {
   if (typeof window === "undefined") return () => {};
   const handleCustom = () => callback();

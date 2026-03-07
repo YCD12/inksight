@@ -10,6 +10,7 @@
 
 // ── Time state ──────────────────────────────────────────────
 int curHour, curMin, curSec;
+static unsigned long lastHeartbeatAt = 0;
 
 // ── WiFi connection ─────────────────────────────────────────
 
@@ -28,6 +29,7 @@ bool connectWiFi() {
         Serial.print(".");
     }
     Serial.printf(" OK  IP=%s\n", WiFi.localIP().toString().c_str());
+    postHeartbeat(true);
     return true;
 }
 
@@ -85,10 +87,119 @@ static bool readExact(WiFiClient *s, uint8_t *buf, int len) {
     return true;
 }
 
+static bool beginHttpForUrl(HTTPClient &http, WiFiClient &plainClient, WiFiClientSecure &secClient, const String &url) {
+    if (url.startsWith("https://")) {
+        secClient.setCACert(ROOT_CA);
+        return http.begin(secClient, url);
+    }
+    return http.begin(plainClient, url);
+}
+
+static String extractJsonStringField(const String &body, const char *key) {
+    String needle = String("\"") + key + "\":\"";
+    int start = body.indexOf(needle);
+    if (start < 0) return "";
+    start += needle.length();
+    int end = body.indexOf('"', start);
+    if (end < 0) return "";
+    return body.substring(start, end);
+}
+
+bool postHeartbeat(bool force) {
+    if (WiFi.status() != WL_CONNECTED) return false;
+    unsigned long now = millis();
+    if (!force && lastHeartbeatAt != 0 && now - lastHeartbeatAt < HEARTBEAT_INTERVAL_MS) {
+        return true;
+    }
+    if (!ensureDeviceToken()) return false;
+
+    float v = readBatteryVoltage();
+    int rssi = WiFi.RSSI();
+    String mac = WiFi.macAddress();
+    String url = cfgServer + "/api/device/" + mac + "/heartbeat";
+    WiFiClient plainClient;
+    WiFiClientSecure secClient;
+    HTTPClient http;
+    if (!beginHttpForUrl(http, plainClient, secClient, url)) return false;
+    http.addHeader("Content-Type", "application/json");
+    if (cfgDeviceToken.length() > 0) {
+        http.addHeader("X-Device-Token", cfgDeviceToken);
+    }
+    http.setTimeout(HTTP_TIMEOUT);
+
+    String body = String("{\"battery_voltage\":") + String(v, 2) + ",\"wifi_rssi\":" + String(rssi) + "}";
+    lastHeartbeatAt = now;
+    int code = http.POST(body);
+    if (code >= 200 && code < 300) {
+        Serial.printf("[HEARTBEAT] POST -> %d\n", code);
+        http.end();
+        return true;
+    }
+    if (code < 0) {
+        Serial.printf("[HEARTBEAT] error: %s\n", http.errorToString(code).c_str());
+    } else {
+        Serial.printf("[HEARTBEAT] POST -> %d\n", code);
+    }
+    http.end();
+    return false;
+}
+
+bool ensureDeviceToken() {
+    if (cfgDeviceToken.length() > 0) return true;
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    String mac = WiFi.macAddress();
+    String url = cfgServer + "/api/device/" + mac + "/token";
+    WiFiClient plainClient;
+    WiFiClientSecure secClient;
+    HTTPClient http;
+    if (!beginHttpForUrl(http, plainClient, secClient, url)) return false;
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(HTTP_TIMEOUT);
+
+    int code = http.POST("{}");
+    if (code < 200 || code >= 300) {
+        http.end();
+        return false;
+    }
+    String body = http.getString();
+    http.end();
+
+    String token = extractJsonStringField(body, "token");
+    if (token.length() == 0) return false;
+    saveDeviceToken(token);
+    return true;
+}
+
+String requestClaimUrl() {
+    if (!ensureDeviceToken()) return "";
+    String mac = WiFi.macAddress();
+    String url = cfgServer + "/api/device/" + mac + "/claim-token";
+    WiFiClient plainClient;
+    WiFiClientSecure secClient;
+    HTTPClient http;
+    if (!beginHttpForUrl(http, plainClient, secClient, url)) return "";
+    http.addHeader("Content-Type", "application/json");
+    if (cfgDeviceToken.length() > 0) {
+        http.addHeader("X-Device-Token", cfgDeviceToken);
+    }
+    http.setTimeout(HTTP_TIMEOUT);
+
+    int code = http.POST("{}");
+    if (code < 200 || code >= 300) {
+        http.end();
+        return "";
+    }
+    String body = http.getString();
+    http.end();
+    return extractJsonStringField(body, "claim_url");
+}
+
 // ── Fetch BMP from backend ──────────────────────────────────
 
 bool fetchBMP(bool nextMode, bool *isFallback) {
     if (isFallback) *isFallback = false;
+    if (!ensureDeviceToken()) return false;
     float v = readBatteryVoltage();
     String mac = WiFi.macAddress();
     int rssi = WiFi.RSSI();
@@ -187,6 +298,7 @@ bool fetchBMP(bool nextMode, bool *isFallback) {
 
     http.end();
     Serial.printf("BMP OK  %d bytes\n", IMG_BUF_LEN);
+    lastHeartbeatAt = millis();
 
 #if DEBUG_MODE
     // Checksum for verifying image data changed
@@ -200,6 +312,7 @@ bool fetchBMP(bool nextMode, bool *isFallback) {
 
 bool hasPendingRemoteAction(bool *shouldExitLive) {
     if (WiFi.status() != WL_CONNECTED) return false;
+    if (!ensureDeviceToken()) return false;
 
     String mac = WiFi.macAddress();
     String url = cfgServer + "/api/device/" + mac + "/state";
@@ -253,6 +366,7 @@ bool hasPendingRemoteAction(bool *shouldExitLive) {
 
 void postConfigToBackend() {
     if (cfgConfigJson.length() == 0) return;
+    if (!ensureDeviceToken()) return;
 
     // Inject MAC address into the config JSON
     String mac = WiFi.macAddress();
@@ -286,6 +400,7 @@ void postConfigToBackend() {
 // ── Post runtime mode to backend ────────────────────────────
 
 bool postRuntimeMode(const char *mode) {
+    if (!ensureDeviceToken()) return false;
     String mac = WiFi.macAddress();
     String url = cfgServer + "/api/device/" + mac + "/runtime";
     bool useSSL = cfgServer.startsWith("https://");

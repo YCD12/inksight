@@ -49,6 +49,7 @@ static const int   CFG_BTN_HOLD_MS = 2000;    // Long press duration to trigger 
 static const int   SHORT_PRESS_MIN_MS = 50;   // Minimum short press duration (debounce)
 static const int   LIVE_POLL_MS = 5000;       // Poll interval for pending remote actions
 static const int   LIVE_WIFI_RETRY_MS = 5000; // Retry interval when WiFi is disconnected
+static const unsigned long HEARTBEAT_INTERVAL_MS = 10UL * 60UL * 1000UL;
 static const int   MAX_RETRY_COUNT = 5;       // Max retries before deep sleep
 // Progressive retry delays in seconds: 5s, 15s, 30s, 60s, 120s
 static const int   RETRY_DELAYS[] = {5, 15, 30, 60, 120};

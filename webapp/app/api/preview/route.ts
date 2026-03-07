@@ -3,5 +3,5 @@ import { proxyGet } from "../_proxy";
 
 export async function GET(req: NextRequest) {
   const qs = req.nextUrl.search;
-  return proxyGet(`/api/preview${qs}`);
+  return proxyGet(`/api/preview${qs}`, req);
 }

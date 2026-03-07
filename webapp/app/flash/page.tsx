@@ -14,7 +14,7 @@ import {
   RefreshCw,
   X,
 } from "lucide-react";
-import { authHeaders, onAuthChanged } from "@/lib/auth";
+import { fetchCurrentUser, onAuthChanged } from "@/lib/auth";
 
 declare global {
   interface Navigator {
@@ -126,13 +126,9 @@ export default function FlashPage() {
   }, []);
 
   const refreshAuthState = useCallback(() => {
-    fetch("/api/auth/me", { headers: authHeaders() })
-      .then((r) => {
-        if (r.ok) {
-          setAuthState("logged_in");
-          return;
-        }
-        setAuthState("guest");
+    fetchCurrentUser()
+      .then((user) => {
+        setAuthState(user ? "logged_in" : "guest");
       })
       .catch(() => setAuthState("guest"));
   }, []);

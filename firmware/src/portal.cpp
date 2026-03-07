@@ -68,6 +68,14 @@ static bool isValidUrl(const String &url) {
     return url.startsWith("http://") || url.startsWith("https://");
 }
 
+static bool isOfficialServerUrl(const String &url) {
+    String lower = url;
+    lower.toLowerCase();
+    return lower.indexOf("://web.inksight.site") >= 0
+        || lower.indexOf("://www.inksight.site") >= 0
+        || lower.indexOf("://inksight.site") >= 0;
+}
+
 // ── Start captive portal ────────────────────────────────────
 
 void startCaptivePortal() {
@@ -209,7 +217,20 @@ void startCaptivePortal() {
             wifiConnected = true;
             lastWifiError = "";
             Serial.printf("WiFi OK  IP=%s\n", WiFi.localIP().toString().c_str());
-            webServer.send(200, "application/json", "{\"ok\":true}");
+            String claimUrl = "";
+            bool manualBind = !isOfficialServerUrl(cfgServer);
+            if (!manualBind) {
+                claimUrl = requestClaimUrl();
+            }
+            String response = "{\"ok\":true";
+            if (claimUrl.length() > 0) {
+                response += ",\"claim_url\":\"" + claimUrl + "\"";
+            }
+            if (manualBind) {
+                response += ",\"manual_bind\":true";
+            }
+            response += "}";
+            webServer.send(200, "application/json", response);
 
             pendingRestart  = true;
             restartAtMillis = millis() + 15000;

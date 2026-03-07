@@ -54,38 +54,31 @@ def validate_mac_param(mac: str) -> str:
     return mac.upper()
 
 
-def require_admin(
-    authorization: Optional[str] = Header(default=None),
-) -> None:
-    """FastAPI 依赖：管理端点鉴权。
-
-    未设置 ADMIN_TOKEN 环境变量时跳过鉴权（本地开发模式）。
-    """
+def is_admin_authorized(authorization: Optional[str]) -> bool:
     admin_token = os.environ.get("ADMIN_TOKEN")
     if not admin_token:
-        return
-
+        return True
     if not authorization:
-        raise HTTPException(status_code=403, detail="需要管理员认证")
+        return False
 
     parts = authorization.split(" ", 1)
     if len(parts) != 2 or parts[0] != "Bearer":
-        raise HTTPException(status_code=403, detail="认证格式无效，应为: Bearer <token>")
+        return False
+    return hmac.compare_digest(parts[1], admin_token)
 
-    if not hmac.compare_digest(parts[1], admin_token):
-        raise HTTPException(status_code=403, detail="管理员 Token 无效")
+
+def require_admin(
+    authorization: Optional[str] = Header(default=None),
+) -> None:
+    """FastAPI 依赖：管理端点鉴权。"""
+    if not is_admin_authorized(authorization):
+        raise HTTPException(status_code=403, detail="需要管理员认证")
 
 
 async def require_device_token(
     mac: str,
     x_device_token: Optional[str] = Header(default=None),
 ) -> bool:
-    """FastAPI 依赖：校验设备 Token。
-
-    宽限期逻辑：
-    - 设备尚未存储 Token（新设备）→ 放行
-    - 设备已有 Token → 请求必须携带匹配的 Token
-    """
     if x_device_token:
         valid = await validate_device_token(mac, x_device_token)
         if valid:
@@ -95,8 +88,7 @@ async def require_device_token(
     if state and state.get("auth_token"):
         logger.warning(f"[AUTH] 设备 Token 校验失败: {mac}")
         raise HTTPException(status_code=401, detail="设备 Token 无效或缺失")
-
-    return True
+    raise HTTPException(status_code=401, detail="设备 Token 缺失，请先完成设备注册")
 
 
 def create_session_token(user_id: int, username: str) -> str:

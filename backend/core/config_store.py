@@ -6,7 +6,7 @@ import logging
 import secrets
 import hashlib
 import aiosqlite
-from datetime import datetime
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -187,7 +187,52 @@ async def init_db():
             )
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_user_devices_user ON user_devices(user_id)")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS device_memberships (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mac TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                role TEXT NOT NULL DEFAULT 'member',
+                status TEXT NOT NULL DEFAULT 'active',
+                nickname TEXT DEFAULT '',
+                granted_by INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(mac, user_id),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_device_memberships_user ON device_memberships(user_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_device_memberships_mac ON device_memberships(mac)")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS device_claim_tokens (
+                token_hash TEXT PRIMARY KEY,
+                mac TEXT NOT NULL,
+                nonce TEXT NOT NULL,
+                source TEXT DEFAULT '',
+                expires_at TEXT NOT NULL,
+                used_at TEXT DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_device_claim_tokens_mac ON device_claim_tokens(mac)")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS device_access_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mac TEXT NOT NULL,
+                requester_user_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                reviewed_by INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(mac, requester_user_id, status),
+                FOREIGN KEY (requester_user_id) REFERENCES users(id)
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_device_access_requests_mac ON device_access_requests(mac)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_device_access_requests_user ON device_access_requests(requester_user_id)")
 
+        await _migrate_legacy_user_devices(db)
         await db.commit()
 
 
@@ -246,47 +291,477 @@ async def authenticate_user(username: str, password: str) -> dict | None:
     return user
 
 
-async def bind_device(user_id: int, mac: str, nickname: str = "") -> bool:
-    now = datetime.now().isoformat()
-    db = await get_main_db()
-    try:
+async def _migrate_legacy_user_devices(db) -> None:
+    cursor = await db.execute(
+        """SELECT mac, user_id, nickname, bound_at
+           FROM user_devices
+           ORDER BY mac ASC, bound_at ASC, id ASC"""
+    )
+    rows = await cursor.fetchall()
+    current_mac = ""
+    owner_user_id = 0
+    for mac, user_id, nickname, bound_at in rows:
+        normalized_mac = str(mac or "").upper()
+        if not normalized_mac:
+            continue
+        role = "member"
+        granted_by = owner_user_id or None
+        if normalized_mac != current_mac:
+            current_mac = normalized_mac
+            owner_user_id = int(user_id)
+            role = "owner"
+            granted_by = None
         await db.execute(
-            "INSERT INTO user_devices (user_id, mac, nickname, bound_at) VALUES (?, ?, ?, ?)",
-            (user_id, mac.upper(), nickname, now),
+            """INSERT OR IGNORE INTO device_memberships
+               (mac, user_id, role, status, nickname, granted_by, created_at, updated_at)
+               VALUES (?, ?, ?, 'active', ?, ?, ?, ?)""",
+            (
+                normalized_mac,
+                user_id,
+                role,
+                nickname or "",
+                granted_by,
+                bound_at or datetime.now().isoformat(),
+                datetime.now().isoformat(),
+            ),
         )
-        await db.commit()
-        return True
-    except aiosqlite.IntegrityError:
-        return False
 
 
-async def unbind_device(user_id: int, mac: str) -> bool:
+def _claim_token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+async def get_device_membership(
+    mac: str,
+    user_id: int,
+    *,
+    include_pending: bool = False,
+) -> dict | None:
+    db = await get_main_db()
+    query = """SELECT dm.mac, dm.user_id, dm.role, dm.status, dm.nickname,
+                      dm.granted_by, dm.created_at, dm.updated_at, u.username
+               FROM device_memberships dm
+               JOIN users u ON u.id = dm.user_id
+               WHERE dm.mac = ? AND dm.user_id = ?"""
+    params: list[object] = [mac.upper(), user_id]
+    if not include_pending:
+        query += " AND dm.status = 'active'"
+    query += " LIMIT 1"
+    cursor = await db.execute(query, tuple(params))
+    row = await cursor.fetchone()
+    if not row:
+        return None
+    return {
+        "mac": row[0],
+        "user_id": row[1],
+        "role": row[2],
+        "status": row[3],
+        "nickname": row[4],
+        "granted_by": row[5],
+        "created_at": row[6],
+        "updated_at": row[7],
+        "username": row[8],
+    }
+
+
+async def get_device_owner(mac: str) -> dict | None:
     db = await get_main_db()
     cursor = await db.execute(
-        "DELETE FROM user_devices WHERE user_id = ? AND mac = ?",
+        """SELECT dm.mac, dm.user_id, dm.nickname, dm.created_at, u.username
+           FROM device_memberships dm
+           JOIN users u ON u.id = dm.user_id
+           WHERE dm.mac = ? AND dm.role = 'owner' AND dm.status = 'active'
+           LIMIT 1""",
+        (mac.upper(),),
+    )
+    row = await cursor.fetchone()
+    if not row:
+        return None
+    return {
+        "mac": row[0],
+        "user_id": row[1],
+        "nickname": row[2],
+        "created_at": row[3],
+        "username": row[4],
+    }
+
+
+async def has_active_membership(mac: str, user_id: int) -> bool:
+    membership = await get_device_membership(mac, user_id)
+    return membership is not None and membership.get("status") == "active"
+
+
+async def is_device_owner(mac: str, user_id: int) -> bool:
+    membership = await get_device_membership(mac, user_id)
+    return membership is not None and membership.get("role") == "owner"
+
+
+async def upsert_device_membership(
+    mac: str,
+    user_id: int,
+    *,
+    role: str,
+    status: str = "active",
+    nickname: str = "",
+    granted_by: int | None = None,
+) -> dict:
+    now = datetime.now().isoformat()
+    db = await get_main_db()
+    await db.execute(
+        """INSERT INTO device_memberships
+           (mac, user_id, role, status, nickname, granted_by, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(mac, user_id) DO UPDATE SET
+               role = excluded.role,
+               status = excluded.status,
+               nickname = CASE
+                   WHEN excluded.nickname != '' THEN excluded.nickname
+                   ELSE device_memberships.nickname
+               END,
+               granted_by = excluded.granted_by,
+               updated_at = excluded.updated_at""",
+        (mac.upper(), user_id, role, status, nickname, granted_by, now, now),
+    )
+    await db.commit()
+    return await get_device_membership(mac, user_id, include_pending=True)
+
+
+async def create_claim_token(mac: str, source: str = "portal", ttl_minutes: int = 10) -> dict:
+    now = datetime.now()
+    token = secrets.token_urlsafe(32)
+    db = await get_main_db()
+    await db.execute(
+        "DELETE FROM device_claim_tokens WHERE used_at != '' OR expires_at <= ?",
+        (now.isoformat(),),
+    )
+    await db.execute(
+        """INSERT INTO device_claim_tokens
+           (token_hash, mac, nonce, source, expires_at, used_at, created_at)
+           VALUES (?, ?, ?, ?, ?, '', ?)""",
+        (
+            _claim_token_hash(token),
+            mac.upper(),
+            secrets.token_hex(8),
+            source,
+            (now + timedelta(minutes=ttl_minutes)).isoformat(),
+            now.isoformat(),
+        ),
+    )
+    await db.commit()
+    return {
+        "token": token,
+        "expires_at": (now + timedelta(minutes=ttl_minutes)).isoformat(),
+    }
+
+
+async def get_pending_access_request(mac: str, requester_user_id: int) -> dict | None:
+    db = await get_main_db()
+    cursor = await db.execute(
+        """SELECT id, mac, requester_user_id, status, reviewed_by, created_at, updated_at
+           FROM device_access_requests
+           WHERE mac = ? AND requester_user_id = ? AND status = 'pending'
+           LIMIT 1""",
+        (mac.upper(), requester_user_id),
+    )
+    row = await cursor.fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "mac": row[1],
+        "requester_user_id": row[2],
+        "status": row[3],
+        "reviewed_by": row[4],
+        "created_at": row[5],
+        "updated_at": row[6],
+    }
+
+
+async def create_access_request(mac: str, requester_user_id: int) -> dict:
+    existing = await get_pending_access_request(mac, requester_user_id)
+    if existing:
+        return existing
+    now = datetime.now().isoformat()
+    db = await get_main_db()
+    cursor = await db.execute(
+        """INSERT INTO device_access_requests
+           (mac, requester_user_id, status, reviewed_by, created_at, updated_at)
+           VALUES (?, ?, 'pending', NULL, ?, ?)""",
+        (mac.upper(), requester_user_id, now, now),
+    )
+    await db.commit()
+    return {
+        "id": cursor.lastrowid,
+        "mac": mac.upper(),
+        "requester_user_id": requester_user_id,
+        "status": "pending",
+        "reviewed_by": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+async def consume_claim_token(token: str, user_id: int) -> dict:
+    now = datetime.now().isoformat()
+    db = await get_main_db()
+    cursor = await db.execute(
+        """SELECT token_hash, mac, expires_at, used_at
+           FROM device_claim_tokens
+           WHERE token_hash = ?
+           LIMIT 1""",
+        (_claim_token_hash(token),),
+    )
+    row = await cursor.fetchone()
+    if not row:
+        return {"status": "invalid"}
+    token_hash, mac, expires_at, used_at = row
+    if used_at or expires_at <= now:
+        return {"status": "expired"}
+    await db.execute(
+        "UPDATE device_claim_tokens SET used_at = ? WHERE token_hash = ?",
+        (now, token_hash),
+    )
+    await db.commit()
+
+    existing = await get_device_membership(mac, user_id, include_pending=True)
+    if existing and existing.get("status") == "active":
+        return {"status": "already_member", "mac": mac, "role": existing.get("role")}
+
+    owner = await get_device_owner(mac)
+    if not owner:
+        membership = await upsert_device_membership(mac, user_id, role="owner", status="active")
+        return {"status": "claimed", "mac": mac, "role": membership.get("role", "owner")}
+
+    pending = await create_access_request(mac, user_id)
+    return {
+        "status": "pending_approval",
+        "mac": mac,
+        "request_id": pending["id"],
+        "owner_username": owner.get("username", ""),
+    }
+
+
+async def bind_device(user_id: int, mac: str, nickname: str = "") -> dict:
+    normalized_mac = mac.upper()
+    existing = await get_device_membership(normalized_mac, user_id, include_pending=True)
+    if existing and existing.get("status") == "active":
+        if nickname and nickname != existing.get("nickname", ""):
+            await upsert_device_membership(
+                normalized_mac,
+                user_id,
+                role=existing.get("role", "member"),
+                status="active",
+                nickname=nickname,
+                granted_by=existing.get("granted_by"),
+            )
+        return {"status": "active", "role": existing.get("role", "member")}
+    if existing and existing.get("status") == "pending":
+        return {"status": "pending_approval"}
+    owner = await get_device_owner(normalized_mac)
+    if not owner:
+        membership = await upsert_device_membership(
+            normalized_mac,
+            user_id,
+            role="owner",
+            status="active",
+            nickname=nickname,
+        )
+        return {"status": "claimed", "role": membership.get("role", "owner")}
+    await create_access_request(normalized_mac, user_id)
+    return {"status": "pending_approval"}
+
+
+async def unbind_device(user_id: int, mac: str) -> str:
+    db = await get_main_db()
+    membership = await get_device_membership(mac, user_id)
+    if not membership:
+        return "not_found"
+    if membership.get("role") == "owner":
+        cursor = await db.execute(
+            """SELECT COUNT(1)
+               FROM device_memberships
+               WHERE mac = ? AND status = 'active' AND user_id != ?""",
+            (mac.upper(), user_id),
+        )
+        row = await cursor.fetchone()
+        if row and row[0]:
+            return "owner_has_members"
+    await db.execute(
+        "DELETE FROM device_memberships WHERE user_id = ? AND mac = ?",
+        (user_id, mac.upper()),
+    )
+    await db.execute(
+        "DELETE FROM device_access_requests WHERE requester_user_id = ? AND mac = ?",
         (user_id, mac.upper()),
     )
     await db.commit()
-    return cursor.rowcount > 0
+    return "ok"
 
 
 async def get_user_devices(user_id: int) -> list[dict]:
     db = await get_main_db()
     cursor = await db.execute(
-        """SELECT ud.mac, ud.nickname, ud.bound_at,
+        """SELECT dm.mac, dm.nickname, dm.created_at, dm.role, dm.status,
                   dh.last_seen
-           FROM user_devices ud
+           FROM device_memberships dm
            LEFT JOIN (
                SELECT mac, MAX(created_at) as last_seen
                FROM device_heartbeats
                GROUP BY mac
-           ) dh ON ud.mac = dh.mac
-           WHERE ud.user_id = ?
-           ORDER BY ud.bound_at DESC""",
+           ) dh ON dm.mac = dh.mac
+           WHERE dm.user_id = ? AND dm.status = 'active'
+           ORDER BY dm.created_at DESC""",
         (user_id,),
     )
     rows = await cursor.fetchall()
-    return [{"mac": r[0], "nickname": r[1], "bound_at": r[2], "last_seen": r[3]} for r in rows]
+    return [
+        {
+            "mac": r[0],
+            "nickname": r[1],
+            "bound_at": r[2],
+            "role": r[3],
+            "status": r[4],
+            "last_seen": r[5],
+        }
+        for r in rows
+    ]
+
+
+async def get_device_members(mac: str) -> list[dict]:
+    db = await get_main_db()
+    cursor = await db.execute(
+        """SELECT dm.user_id, u.username, dm.role, dm.status, dm.nickname,
+                  dm.granted_by, dm.created_at, dm.updated_at
+           FROM device_memberships dm
+           JOIN users u ON u.id = dm.user_id
+           WHERE dm.mac = ? AND dm.status = 'active'
+           ORDER BY CASE dm.role WHEN 'owner' THEN 0 ELSE 1 END, dm.created_at ASC""",
+        (mac.upper(),),
+    )
+    rows = await cursor.fetchall()
+    return [
+        {
+            "user_id": row[0],
+            "username": row[1],
+            "role": row[2],
+            "status": row[3],
+            "nickname": row[4],
+            "granted_by": row[5],
+            "created_at": row[6],
+            "updated_at": row[7],
+        }
+        for row in rows
+    ]
+
+
+async def get_pending_requests_for_owner(owner_user_id: int) -> list[dict]:
+    db = await get_main_db()
+    cursor = await db.execute(
+        """SELECT dar.id, dar.mac, dar.requester_user_id, u.username, dar.status,
+                  dar.created_at, dar.updated_at
+           FROM device_access_requests dar
+           JOIN users u ON u.id = dar.requester_user_id
+           JOIN device_memberships dm
+             ON dm.mac = dar.mac AND dm.user_id = ? AND dm.role = 'owner' AND dm.status = 'active'
+           WHERE dar.status = 'pending'
+           ORDER BY dar.created_at ASC""",
+        (owner_user_id,),
+    )
+    rows = await cursor.fetchall()
+    return [
+        {
+            "id": row[0],
+            "mac": row[1],
+            "requester_user_id": row[2],
+            "requester_username": row[3],
+            "status": row[4],
+            "created_at": row[5],
+            "updated_at": row[6],
+        }
+        for row in rows
+    ]
+
+
+async def approve_access_request(request_id: int, owner_user_id: int) -> dict | None:
+    db = await get_main_db()
+    cursor = await db.execute(
+        """SELECT dar.id, dar.mac, dar.requester_user_id, dar.status
+           FROM device_access_requests dar
+           JOIN device_memberships dm
+             ON dm.mac = dar.mac AND dm.user_id = ? AND dm.role = 'owner' AND dm.status = 'active'
+           WHERE dar.id = ?
+           LIMIT 1""",
+        (owner_user_id, request_id),
+    )
+    row = await cursor.fetchone()
+    if not row or row[3] != "pending":
+        return None
+    _, mac, requester_user_id, _status = row
+    await upsert_device_membership(mac, requester_user_id, role="member", status="active", granted_by=owner_user_id)
+    now = datetime.now().isoformat()
+    await db.execute(
+        "UPDATE device_access_requests SET status = 'approved', reviewed_by = ?, updated_at = ? WHERE id = ?",
+        (owner_user_id, now, request_id),
+    )
+    await db.commit()
+    return await get_device_membership(mac, requester_user_id)
+
+
+async def reject_access_request(request_id: int, owner_user_id: int) -> bool:
+    db = await get_main_db()
+    cursor = await db.execute(
+        """UPDATE device_access_requests
+           SET status = 'rejected', reviewed_by = ?, updated_at = ?
+           WHERE id = ? AND status = 'pending' AND mac IN (
+               SELECT mac FROM device_memberships
+               WHERE user_id = ? AND role = 'owner' AND status = 'active'
+           )""",
+        (owner_user_id, datetime.now().isoformat(), request_id, owner_user_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def share_device_with_user(owner_user_id: int, mac: str, target_user_id: int) -> dict:
+    membership = await get_device_membership(mac, target_user_id, include_pending=True)
+    if membership and membership.get("status") == "active":
+        return {"status": "already_member", "membership": membership}
+    created = await upsert_device_membership(
+        mac,
+        target_user_id,
+        role="member",
+        status="active",
+        granted_by=owner_user_id,
+    )
+    db = await get_main_db()
+    await db.execute(
+        """UPDATE device_access_requests
+           SET status = 'approved', reviewed_by = ?, updated_at = ?
+           WHERE mac = ? AND requester_user_id = ? AND status = 'pending'""",
+        (owner_user_id, datetime.now().isoformat(), mac.upper(), target_user_id),
+    )
+    await db.commit()
+    return {"status": "shared", "membership": created}
+
+
+async def revoke_device_member(owner_user_id: int, mac: str, target_user_id: int) -> bool:
+    if owner_user_id == target_user_id:
+        return False
+    db = await get_main_db()
+    cursor = await db.execute(
+        """DELETE FROM device_memberships
+           WHERE mac = ? AND user_id = ? AND role != 'owner' AND mac IN (
+               SELECT mac FROM device_memberships
+               WHERE user_id = ? AND role = 'owner' AND status = 'active'
+           )""",
+        (mac.upper(), target_user_id, owner_user_id),
+    )
+    await db.execute(
+        "DELETE FROM device_access_requests WHERE mac = ? AND requester_user_id = ?",
+        (mac.upper(), target_user_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
 
 
 async def save_config(mac: str, data: dict) -> int:

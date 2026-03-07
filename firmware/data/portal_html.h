@@ -157,7 +157,7 @@ body{font-family:var(--f);background:linear-gradient(135deg,#f5f5f0,#e8e8e0);col
 <script>
 var OFFICIAL_SERVER='https://web.inksight.site/';
 var LOCAL_DEFAULT_SERVER='http://本地服务IP:8080';
-var ssid='',ctm=null,devMac='',srvUrl='',srvMode='official';
+var ssid='',ctm=null,devMac='',srvUrl='',srvMode='official',claimUrl='',manualBindRequired=false;
 var hiddenSsids=[];
 
 function setStep(n){
@@ -242,6 +242,8 @@ btn.classList.remove('ld');btn.disabled=false;
 if(d.ok){
 st.className='st s';st.textContent='WiFi 已连接';
 document.getElementById('cSSID').textContent=s;
+claimUrl=d.claim_url||'';
+manualBindRequired=!!d.manual_bind;
 showSuccess();
 }else{
 st.className='st e';st.textContent=d.msg||'连接失败';
@@ -253,21 +255,8 @@ st.className='st e';st.textContent='请求失败，请重试';
 }
 
 function getConfigUrl(){
-if(!srvUrl)return'https://www.inksight.site/config'+(devMac?'?mac='+encodeURIComponent(devMac):'');
-try{
-var u=new URL(srvUrl);
-var h=(u.hostname||'').toLowerCase();
-var isPrivate=(h==='localhost'||h==='127.0.0.1'||h==='::1'||/^10\./.test(h)||/^192\.168\./.test(h)||/^172\.(1[6-9]|2\d|3[0-1])\./.test(h));
-if(isPrivate){
-return u.protocol+'//localhost:3000/config'+(devMac?'?mac='+encodeURIComponent(devMac):'');
-}
-if(h==='web.inksight.site'||h==='inksight.site'||h==='www.inksight.site'){
-return'https://www.inksight.site/config'+(devMac?'?mac='+encodeURIComponent(devMac):'');
-}
-return u.origin+'/config'+(devMac?'?mac='+encodeURIComponent(devMac):'');
-}catch(e){
-return srvUrl.replace(/\/$/,'')+'/config'+(devMac?'?mac='+encodeURIComponent(devMac):'');
-}
+if(claimUrl)return claimUrl;
+return'';
 }
 
 function showSuccess(){
@@ -285,11 +274,15 @@ if(c<=0){clearInterval(ctm);ctm=null;doRestart();}
 function doRestart(){
 if(ctm)clearInterval(ctm);
 document.getElementById('pSt').className='st c';
-document.getElementById('pSt').textContent='设备重启中，即将跳转至配置页...';
+document.getElementById('pSt').textContent=manualBindRequired?'设备重启中，请稍后在自部署站点手动绑定...':'设备重启中，即将跳转至领取页...';
 fetch('/restart',{method:'POST'}).catch(function(){});
 var url=getConfigUrl();
 setTimeout(function(){
-document.body.innerHTML='<div style="text-align:center;padding:50px;font-family:sans-serif"><h2>正在跳转至配置页</h2><p style="color:#888">请确保已切换回家庭 WiFi</p><p style="margin-top:12px"><a href="'+url+'" style="color:#3b82f6">点击此处手动跳转</a></p></div>';
+if(!url){
+document.body.innerHTML=manualBindRequired?'<div style="text-align:center;padding:50px;font-family:sans-serif"><h2>设备已重启</h2><p style="color:#888">当前为自定义服务，请切换回家庭 WiFi 后在自部署站点手动绑定并配置设备。</p></div>':'<div style="text-align:center;padding:50px;font-family:sans-serif"><h2>领取链接生成失败</h2><p style="color:#888">请切换回家庭 WiFi 后登录官网，在设备列表中手动处理该设备。</p></div>';
+return;
+}
+document.body.innerHTML='<div style="text-align:center;padding:50px;font-family:sans-serif"><h2>正在跳转至领取页</h2><p style="color:#888">请确保已切换回家庭 WiFi</p><p style="margin-top:12px"><a href="'+url+'" style="color:#3b82f6">点击此处手动跳转</a></p></div>';
 window.location.href=url;
 },3000);
 }

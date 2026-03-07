@@ -27,6 +27,10 @@ bool postRuntimeMode(const char *mode);
 // POST device config JSON to backend /api/config endpoint.
 void postConfigToBackend();
 
+bool ensureDeviceToken();
+String requestClaimUrl();
+bool postHeartbeat(bool force = false);
+
 // ── Battery ─────────────────────────────────────────────────
 
 // Read battery voltage via ADC (returns volts)

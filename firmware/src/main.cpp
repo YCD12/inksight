@@ -289,6 +289,10 @@ void loop() {
         }
     }
 
+    if (WiFi.status() == WL_CONNECTED) {
+        postHeartbeat();
+    }
+
     delay(50);
 }
 

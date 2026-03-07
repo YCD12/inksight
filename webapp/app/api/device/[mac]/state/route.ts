@@ -2,9 +2,9 @@ import { NextRequest } from "next/server";
 import { proxyGet } from "../../../_proxy";
 
 export async function GET(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: Promise<{ mac: string }> },
 ) {
   const { mac } = await params;
-  return proxyGet(`/api/device/${encodeURIComponent(mac)}/state`);
+  return proxyGet(`/api/device/${encodeURIComponent(mac)}/state`, req);
 }

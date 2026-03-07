@@ -44,8 +44,7 @@ function LoginForm() {
         return;
       }
       if (data.token) setToken(data.token);
-      const loginNext = next.startsWith("/config?mac=") ? "/config" : next;
-      router.push(loginNext);
+      router.push(next);
       router.refresh();
     } catch {
       setError("网络错误");

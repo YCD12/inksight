@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback } from "react";
 import Link from "next/link";
 import { useRouter, usePathname } from "next/navigation";
 import { Menu, X, Github, User, LogOut } from "lucide-react";
-import { authHeaders, clearToken, onAuthChanged } from "@/lib/auth";
+import { authHeaders, clearToken, fetchCurrentUser, onAuthChanged } from "@/lib/auth";
 
 const navLinks = [
   { href: "/", label: "首页" },
@@ -20,8 +20,7 @@ export function Navbar() {
   const [username, setUsername] = useState<string | null>(null);
 
   const refreshUser = useCallback(() => {
-    fetch("/api/auth/me", { headers: authHeaders() })
-      .then((r) => (r.ok ? r.json() : null))
+    fetchCurrentUser()
       .then((d) => setUsername(d?.username || null))
       .catch(() => setUsername(null));
   }, []);
