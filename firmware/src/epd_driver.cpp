@@ -1,6 +1,8 @@
 #include "epd_driver.h"
 #include "config.h"
 
+#if !defined(EPD_PANEL_75_GDEY075Z08)
+
 #if defined(EPD_PANEL_42_SSD1683_BW) || defined(EPD_PANEL_42_DKE_RY683) || defined(EPD_PANEL_42_GDEM042F52)
 
 // ── Software SPI (bit-bang) for 4.2" SSD1683 BW panels ──
@@ -738,4 +740,6 @@ void epdSleep() {
 #endif
 }
 
-#endif // EPD_PANEL_42_SSD1683_BW
+#endif
+
+#endif
