@@ -1,7 +1,7 @@
 #include "epd_driver.h"
 #include "config.h"
 
-#if !defined(EPD_PANEL_75_GDEY075Z08)
+#if !defined(EPD_PANEL_75_GDEY075Z08) && !defined(EPD_PANEL_583_GDEY0583Z21)
 
 #if defined(EPD_PANEL_42_SSD1683_BW) || defined(EPD_PANEL_42_DKE_RY683) || defined(EPD_PANEL_42_GDEM042F52)
 

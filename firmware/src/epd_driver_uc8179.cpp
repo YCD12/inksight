@@ -194,7 +194,6 @@ static void uc8179ClearWhite() {
 
 static void epdDisplayPreparedPlanes(const uint8_t* black_plane, const uint8_t* color_plane) {
     uc8179InitController();
-    uc8179ClearWhite();
     uc8179WriteImage(black_plane, color_plane, false);
     uc8179Refresh();
 }

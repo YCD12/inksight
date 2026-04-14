@@ -64,7 +64,7 @@ static const int IMG_BUF_LEN = ROW_BYTES * H;
 #define EPD_BPP 1
 #endif
 
-#if defined(EPD_PANEL_75_GDEY075Z08)
+#if defined(EPD_PANEL_75_GDEY075Z08) || defined(EPD_PANEL_583_GDEY0583Z21)
 #define EPD_COLOR_CAPABILITY 3
 #elif EPD_BPP >= 2
 #define EPD_COLOR_CAPABILITY 4
