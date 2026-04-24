@@ -30,9 +30,11 @@
 #define PIN_EPD_DC     10
 #define PIN_EPD_RST    38
 #define PIN_EPD_BUSY   4
-// Seeed XIAO ESP32S3 onboard ADC_BAT shares GPIO10 with the current EPD_DC
-// wiring, so battery sampling must only happen while the display bus is idle.
-#define PIN_BAT_ADC    10
+// BAT_ADC → GPIO1 via R28/R29 (1:1 divider), gated by ADC_EN on GPIO6
+// which controls a TPS22916 load switch between VBAT and the divider.
+// Pull ADC_EN HIGH to enable sampling, LOW otherwise (saves ~quiescent current).
+#define PIN_BAT_ADC    1
+#define PIN_BAT_ADC_EN 6
 #define PIN_CFG_BTN    2
 #define PIN_LED        LED_BUILTIN
 #else

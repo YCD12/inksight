@@ -27,18 +27,17 @@ static bool checkAbort() {
 
 static bool recoverDeviceTokenIfUnauthorized(int code);
 
-// XIAO ESP32S3 routes onboard battery ADC and EPD_DC to GPIO10, so battery
-// sampling must temporarily release the display DC line while the EPD bus is idle.
-#if defined(BOARD_PROFILE_XIAO_ESP32S3) && (PIN_BAT_ADC == PIN_EPD_DC)
+// XIAO ePaper Monitor Kit gates the battery divider (VBAT→R28/R29→GPIO1) with a
+// TPS22916 load switch controlled by ADC_EN on GPIO6. Assert HIGH before reading.
+#if defined(BOARD_PROFILE_XIAO_ESP32S3) && defined(PIN_BAT_ADC_EN)
 static void beginBatteryAdcSample() {
-    digitalWrite(PIN_EPD_CS, HIGH);
-    pinMode(PIN_EPD_DC, INPUT);
-    delayMicroseconds(50);
+    pinMode(PIN_BAT_ADC_EN, OUTPUT);
+    digitalWrite(PIN_BAT_ADC_EN, HIGH);
+    delay(2);  // Settling: load switch turn-on + divider RC
 }
 
 static void endBatteryAdcSample() {
-    pinMode(PIN_EPD_DC, OUTPUT);
-    digitalWrite(PIN_EPD_DC, LOW);
+    digitalWrite(PIN_BAT_ADC_EN, LOW);
 }
 #endif
 
@@ -121,18 +120,21 @@ bool connectWiFi() {
 // ── Battery voltage ─────────────────────────────────────────
 
 float readBatteryVoltage() {
-    const int SAMPLES = 16;
-    const int DISCARD = 2;  // Discard highest and lowest outliers
+    const int SAMPLES = 64;
+    const int DISCARD = 8;  // Discard highest and lowest outliers (top/bottom 1/8)
     int readings[SAMPLES];
 
-#if defined(BOARD_PROFILE_XIAO_ESP32S3) && (PIN_BAT_ADC == PIN_EPD_DC)
+#if defined(BOARD_PROFILE_XIAO_ESP32S3) && defined(PIN_BAT_ADC_EN)
     beginBatteryAdcSample();
 #endif
+    analogSetPinAttenuation(PIN_BAT_ADC, ADC_11db);
+    // Spread samples across ~32ms to average out low-frequency supply ripple
+    // (WiFi TX bursts, DC-DC switching) in addition to ADC noise.
     for (int i = 0; i < SAMPLES; i++) {
         readings[i] = analogRead(PIN_BAT_ADC);
-        delayMicroseconds(100);
+        delayMicroseconds(500);
     }
-#if defined(BOARD_PROFILE_XIAO_ESP32S3) && (PIN_BAT_ADC == PIN_EPD_DC)
+#if defined(BOARD_PROFILE_XIAO_ESP32S3) && defined(PIN_BAT_ADC_EN)
     endBatteryAdcSample();
 #endif
 
