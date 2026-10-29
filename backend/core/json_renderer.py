@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,21 +31,29 @@ from .patterns.utils import (
     paste_icon_onto,
     load_icon,
     wrap_text,
+    wrap_text_fill_sidebar,
     has_cjk,
+    safe_font_bbox,
 )
 from .layout_presets import expand_layout_presets
 from .mode_catalog import builtin_catalog_map
+from .image_processing import convert_image_block
 
 logger = logging.getLogger(__name__)
 
+# Cap component-tree scaling on wide panels so preset pt sizes stay near the bitmap PCF grid
+# (see patterns.utils INKSIGHT_BITMAP_MAX_REQUEST_SIZE). width >= LARGE_PANEL_MIN_W covers
+# 583-inch class (648 px) and 7.5-inch class (800 px) bodies.
+_COMPONENT_TREE_SCALE_CAP = float(
+    os.getenv(
+        "INKSIGHT_COMPONENT_TREE_SCALE_MAX",
+        os.getenv("INKSIGHT_648_COMPONENT_SCALE_MAX", "1.35"),
+    )
+)
+_LARGE_PANEL_MIN_W = int(os.getenv("INKSIGHT_LARGE_PANEL_MIN_WIDTH", "648"))
+
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 _UPLOAD_DIR = _BACKEND_ROOT / "runtime_uploads"
-_PALETTE_RGB = {
-    0: (0, 0, 0),
-    1: (255, 255, 255),
-    2: (232, 176, 0),
-    3: (200, 0, 0),
-}
 
 STATUS_BAR_BOTTOM_DEFAULT = 36  # Used when screen_h unknown (e.g. dataclass default)
 
@@ -142,71 +151,10 @@ def _resolve_template(content: dict, template: str) -> str:
     return re.sub(r"\{(\w+)\}", _replace, template)
 
 
-def _aligned_offset(container: int, content: int, align: str) -> int:
-    if align in ("left", "top", "start"):
-        return 0
-    if align in ("right", "bottom", "end"):
-        return container - content
-    return (container - content) // 2
-
-
 def _resolve_named_color(ctx: RenderContext, color_name: Any, default: int = EINK_FG) -> int:
     if not isinstance(color_name, str) or not color_name:
         return default
     return ctx.color_index(color_name, default)
-
-
-def _convert_image_block(
-    src: Image.Image,
-    width: int,
-    height: int,
-    colors: int,
-    fit: str = "fill",
-    align_x: str = "center",
-    align_y: str = "center",
-) -> Image.Image:
-    src_rgba = src.convert("RGBA")
-    fit_mode = str(fit or "fill").lower()
-    if fit_mode in ("fill", "stretch"):
-        base = Image.new("RGBA", (width, height), (255, 255, 255, 255))
-        base.alpha_composite(src_rgba.resize((width, height), Image.LANCZOS))
-    else:
-        src_w = max(1, src_rgba.size[0])
-        src_h = max(1, src_rgba.size[1])
-        scale_x = width / src_w
-        scale_y = height / src_h
-        scale = min(scale_x, scale_y) if fit_mode == "contain" else max(scale_x, scale_y)
-        resized_w = max(1, int(round(src_w * scale)))
-        resized_h = max(1, int(round(src_h * scale)))
-        resized = src_rgba.resize((resized_w, resized_h), Image.LANCZOS)
-        base = Image.new("RGBA", (width, height), (255, 255, 255, 255))
-        paste_x = _aligned_offset(width, resized_w, align_x)
-        paste_y = _aligned_offset(height, resized_h, align_y)
-        base.alpha_composite(resized, (paste_x, paste_y))
-    rgb = base.convert("RGB")
-    if colors < 3:
-        return rgb.convert("L").convert("1")
-    out = Image.new("P", rgb.size, EINK_BG)
-    pal = EINK_4COLOR_PALETTE + [0] * (768 - len(EINK_4COLOR_PALETTE))
-    out.putpalette(pal)
-    allowed = (0, 1, 3) if colors == 3 else (0, 1, 2, 3)
-    cache: dict[tuple[int, int, int], int] = {}
-    mapped: list[int] = []
-    for pixel in rgb.getdata():
-        idx = cache.get(pixel)
-        if idx is None:
-            idx = min(
-                allowed,
-                key=lambda candidate: (
-                    (pixel[0] - _PALETTE_RGB[candidate][0]) ** 2
-                    + (pixel[1] - _PALETTE_RGB[candidate][1]) ** 2
-                    + (pixel[2] - _PALETTE_RGB[candidate][2]) ** 2
-                ),
-            )
-            cache[pixel] = idx
-        mapped.append(idx)
-    out.putdata(mapped)
-    return out
 
 
 @dataclass
@@ -222,10 +170,11 @@ class RenderContext:
     available_width: int = SCREEN_WIDTH
     footer_height: int = 30
     colors: int = 2
+    footer_top_offset: int = 0
 
     @property
     def scale(self) -> float:
-        return self.screen_w / 400.0
+        return max(0.92, self.screen_w / 400.0)
 
     @property
     def h_scale(self) -> float:
@@ -234,7 +183,7 @@ class RenderContext:
     @property
     def min_scale(self) -> float:
         """Conservative scale factor based on the more constrained dimension."""
-        return min(self.scale, self.h_scale)
+        return max(0.65, min(self.scale, self.h_scale))
 
     def __post_init__(self):
         if self.available_width == SCREEN_WIDTH and self.screen_w != SCREEN_WIDTH:
@@ -242,7 +191,7 @@ class RenderContext:
 
     @property
     def footer_top(self) -> int:
-        return self.screen_h - self.footer_height
+        return self.screen_h - self.footer_height + self.footer_top_offset
 
     def resolve(self, template: str) -> str:
         """Resolve {field} placeholders against content dict."""
@@ -335,7 +284,11 @@ def _paint_component_debug_overlay(ctx: RenderContext, node: ComponentNode) -> N
         if font is not None and lines and line_height > 0:
             align = node.props.get("align", "left")
             align_y = node.props.get("align_y", "top")
-            y = _component_aligned_y(box.y, box.height, total_height, align_y)
+            try:
+                ink_dy_dbg = int(node.props.get("ink_offset_y", 0) or 0)
+            except (TypeError, ValueError):
+                ink_dy_dbg = 0
+            y = _component_aligned_y(box.y, box.height, total_height, align_y) + ink_dy_dbg
             for line in lines:
                 bbox = font.getbbox(line)
                 line_width = bbox[2] - bbox[0]
@@ -390,13 +343,33 @@ def _uses_component_tree(body: Any, layout: dict) -> bool:
     if layout.get("layout_engine") == "component_tree":
         return True
     if isinstance(body, dict):
-        return body.get("type") in {"column", "row", "repeat", "section_box", "box"}
+        return body.get("type") in {"column", "row", "repeat", "section_box", "box", "float_wrap"}
     return False
 
 
 def _scaled_value(value: Any, scale: float, default: int = 0, minimum: int = 0) -> int:
     raw = value if isinstance(value, (int, float)) else default
     return max(minimum, int(raw * scale))
+
+
+def _component_tree_scale(ctx: RenderContext, theme: dict) -> float:
+    """Return the effective component-tree scale.
+
+    Raw ctx.scale grows with screen width (e.g. 648 px -> 1.62). Applying that fully to font
+    sizes pushes past PCF bitmap coverage and falls back to blurry TTF on e-ink. For wide
+    panels (screen_w >= INKSIGHT_LARGE_PANEL_MIN_WIDTH) we cap by INKSIGHT_COMPONENT_TREE_SCALE_MAX
+    (default 1.35, same legacy cap as the old 648-only branch). Modes may set layout.component_scale.
+    """
+    raw = ctx.scale
+    override = theme.get("component_scale") or theme.get("scale")
+    if override is not None:
+        try:
+            return max(0.65, float(override))
+        except (TypeError, ValueError):
+            pass
+    if ctx.screen_w >= _LARGE_PANEL_MIN_W:
+        return min(raw, _COMPONENT_TREE_SCALE_CAP)
+    return raw
 
 
 def _component_grow(node: ComponentNode) -> int:
@@ -453,15 +426,18 @@ def _component_load_font(node: ComponentNode, text: str, theme: dict, scale: flo
 def _fit_line_with_ellipsis(text: str, font: Any, max_width: int) -> str:
     if max_width <= 0:
         return "..."
-    if font.getbbox(text)[2] <= max_width:
+    b0 = safe_font_bbox(font, text)
+    if b0[2] - b0[0] <= max_width:
         return text
     ellipsis = "..."
-    if font.getbbox(ellipsis)[2] > max_width:
+    eb = safe_font_bbox(font, ellipsis)
+    if eb[2] - eb[0] > max_width:
         return ellipsis
     trimmed = text.rstrip(". ")
     while trimmed:
         candidate = trimmed.rstrip() + ellipsis
-        if font.getbbox(candidate)[2] <= max_width:
+        cb = safe_font_bbox(font, candidate)
+        if cb[2] - cb[0] <= max_width:
             return candidate
         trimmed = trimmed[:-1]
     return ellipsis
@@ -488,7 +464,7 @@ def _component_measure_text(node: ComponentNode, available_width: int | None, th
     line_height = _scaled_value(node.props.get("line_height"), scale, font_size + theme.get("body_line_gap", 4), 1)
     text_width = 0
     for line in lines:
-        bbox = font.getbbox(line)
+        bbox = safe_font_bbox(font, line)
         text_width = max(text_width, bbox[2] - bbox[0])
     node.measured_width = available_width if available_width is not None else text_width
     node.measured_height = len(lines) * line_height if lines else 0
@@ -541,10 +517,30 @@ def _build_component_node(defn: dict, content: dict) -> ComponentNode:
         if not isinstance(items, list):
             items = []
         limit = defn.get("limit", defn.get("max_items", len(items)))
+        try:
+            lim_int = int(limit) if limit is not None else len(items)
+        except (TypeError, ValueError):
+            lim_int = len(items)
+        raw_items = items[:lim_int] if lim_int >= 0 else items
+        pair_step = int(defn.get("pair_step", 1) or 1)
+        pair_sep = str(defn.get("pair_separator", ""))
+        if pair_step > 1 and raw_items:
+            paired: list[Any] = []
+            for i in range(0, len(raw_items), pair_step):
+                chunk = raw_items[i : i + pair_step]
+                if not chunk:
+                    continue
+                if all(isinstance(x, str) for x in chunk):
+                    paired.append(pair_sep.join(chunk))
+                else:
+                    paired.extend(chunk)
+            items = paired
+        else:
+            items = raw_items
         item_def = defn.get("item")
         children: list[ComponentNode] = []
         if isinstance(item_def, dict):
-            for idx, item in enumerate(items[:limit]):
+            for idx, item in enumerate(items):
                 item_content = dict(content)
                 item_content["index"] = idx + 1
                 item_content["_item"] = item
@@ -561,6 +557,98 @@ def _build_component_node(defn: dict, content: dict) -> ComponentNode:
     return ComponentNode(kind=kind, props=defn, content=content, children=children)
 
 
+def _float_wrap_field_text(node: ComponentNode) -> str:
+    field_name = node.props.get("text_field") or node.props.get("field")
+    if not field_name:
+        return ""
+    value = node.content.get(str(field_name), "")
+    if isinstance(value, list):
+        return ", ".join(str(v) for v in value)
+    return str(value)
+
+
+def _measure_float_wrap_node(node: ComponentNode, available_width: int | None, theme: dict, scale: float) -> None:
+    gap = _scaled_value(node.props.get("gap"), scale, 4, 0)
+    float_below_gap = _scaled_value(node.props.get("float_below_gap"), scale, 2, 0)
+    inner_w = max(0, (available_width or 0))
+    if not node.children:
+        node.measured_width = inner_w
+        node.measured_height = 0
+        node.draw_data = {
+            "gap": gap,
+            "float_below_gap": float_below_gap,
+            "float_w": 0,
+            "float_h": 0,
+            "side_lines": [],
+            "below_lines": [],
+            "font": None,
+            "line_height": 0,
+        }
+        return
+    fc = node.children[0]
+    _measure_component_node(fc, available_width, theme, scale)
+    fw, fh = fc.measured_width, fc.measured_height
+    side_w = max(0, inner_w - fw - gap)
+    text = _strip_emoji(_float_wrap_field_text(node))
+    shim = ComponentNode(kind="text", props=node.props, content=node.content, children=[])
+    font, font_size = _component_load_font(
+        shim, text if text.strip() else " ",
+        theme, scale,
+        "noto_serif_regular",
+        theme.get("body_font_size", 12),
+    )
+    line_height = _scaled_value(node.props.get("line_height"), scale, font_size + theme.get("body_line_gap", 4), 1)
+    if not text.strip():
+        node.measured_width = inner_w if inner_w > 0 else fw
+        node.measured_height = fh
+        node.draw_data = {
+            "gap": gap,
+            "float_below_gap": float_below_gap,
+            "float_w": fw,
+            "float_h": fh,
+            "side_lines": [],
+            "below_lines": [],
+            "font": None,
+            "line_height": line_height,
+        }
+        return
+    side_lines, remainder = wrap_text_fill_sidebar(text, font, side_w, fh, line_height)
+    below_w = max(1, inner_w - fw - gap) if inner_w > 0 else max(1, side_w or 1)
+    below_lines = wrap_text(remainder, font, below_w) if remainder else []
+    max_below = node.props.get("wrap_below_max_lines")
+    if max_below is not None:
+        try:
+            mb = int(max_below)
+            if mb >= 0 and len(below_lines) > mb:
+                below_lines = below_lines[:mb]
+                ellipsis = node.props.get("ellipsis", True)
+                if below_lines and ellipsis:
+                    below_lines[-1] = _fit_line_with_ellipsis(below_lines[-1], font, below_w)
+        except (TypeError, ValueError):
+            pass
+    side_text_bottom = len(side_lines) * line_height
+    if below_lines:
+        text_stack_bottom = side_text_bottom + float_below_gap + len(below_lines) * line_height
+        total_h = max(fh, text_stack_bottom)
+    else:
+        total_h = fh
+    node.measured_width = inner_w if inner_w > 0 else fw + gap + max(side_w, 1)
+    node.measured_height = total_h
+    node.draw_data = {
+        "gap": gap,
+        "float_below_gap": float_below_gap,
+        "float_w": fw,
+        "float_h": fh,
+        "below_x_shift": fw + gap,
+        "below_text_width": below_w,
+        "side_text_bottom": side_text_bottom,
+        "side_lines": side_lines,
+        "below_lines": below_lines,
+        "font": font,
+        "line_height": line_height,
+    }
+
+
 def _measure_component_node(node: ComponentNode, available_width: int | None, theme: dict, scale: float) -> None:
     if node.kind == "text":
         _component_measure_text(node, available_width, theme, scale)
@@ -573,6 +661,13 @@ def _measure_component_node(node: ComponentNode, available_width: int | None, th
         return
     if node.kind == "separator":
         _measure_component_separator(node, available_width, scale)
+        return
+    if node.kind == "spacer":
+        sh_raw = node.props.get("height", node.props.get("min_height", 6))
+        sh = _scaled_value(sh_raw, scale, 6, 1)
+        node.measured_width = available_width if available_width is not None else 0
+        node.measured_height = max(0, int(sh))
+        node.draw_data = {}
         return
     if node.kind == "repeat":
         gap = _scaled_value(node.props.get("gap"), scale)
@@ -695,6 +790,9 @@ def _measure_component_node(node: ComponentNode, available_width: int | None, th
             "child_gap": child_gap,
         }
         return
+    if node.kind == "float_wrap":
+        _measure_float_wrap_node(node, available_width, theme, scale)
+        return
     if node.kind == "box":
         left, top, right, bottom = _component_padding(node.props, scale)
         inner_width = None if available_width is None else max(0, available_width - left - right)
@@ -749,6 +847,13 @@ def _layout_component_node(node: ComponentNode, x: int, y: int, width: int, heig
                 cursor_y += extra
             elif justify == "space_between" and len(visible_children) > 1:
                 gap_step = gap + extra // (len(visible_children) - 1)
+        bias_px = node.props.get("content_bias_px")
+        if bias_px is not None:
+            try:
+                cursor_y -= int(bias_px)
+            except (TypeError, ValueError):
+                pass
+            cursor_y = max(inner_y, cursor_y)
         for idx, child in enumerate(visible_children):
             child_height = child.measured_height
             grow = _component_grow(child)
@@ -802,13 +907,25 @@ def _layout_component_node(node: ComponentNode, x: int, y: int, width: int, heig
         content_indent = node.draw_data.get("content_indent", 0)
         child_gap = node.draw_data.get("child_gap", 0)
         child_x = x + content_indent
-        child_y = y + title_height + title_gap
+        raw_coff = node.props.get("content_ink_offset_y")
+        try:
+            content_off = int(raw_coff) if raw_coff is not None else 0
+        except (TypeError, ValueError):
+            content_off = 0
+        child_y = y + title_height + title_gap + content_off
         child_width = max(0, width - content_indent)
         for idx, child in enumerate([c for c in node.children if c.measured_height > 0 or c.measured_width > 0]):
             _layout_component_node(child, child_x, child_y, child_width, child.measured_height, theme, scale)
             child_y += child.measured_height
             if idx < len(node.children) - 1:
                 child_y += child_gap
+        return
+    if node.kind == "float_wrap":
+        dd = node.draw_data
+        fw = int(dd.get("float_w") or 0)
+        fh = int(dd.get("float_h") or 0)
+        if node.children:
+            _layout_component_node(node.children[0], x, y, fw, fh, theme, scale)
         return
     if node.kind == "box":
         left, top, right, bottom = node.draw_data.get("padding", (0, 0, 0, 0))
@@ -818,11 +935,41 @@ def _layout_component_node(node: ComponentNode, x: int, y: int, width: int, heig
         inner_height = max(0, height - top - bottom)
         for child in node.children:
             _layout_component_node(child, inner_x, inner_y, inner_width, min(inner_height, child.measured_height), theme, scale)
+        return
 
 
 def _paint_component_node(ctx: RenderContext, node: ComponentNode, theme: dict, scale: float) -> None:
     box = node.box
     if box is None:
+        return
+    if node.kind == "spacer":
+        return
+    if node.kind == "float_wrap":
+        for child in node.children:
+            _paint_component_node(ctx, child, theme, scale)
+        dd = node.draw_data
+        font = dd.get("font")
+        if font is None:
+            return
+        lh = int(dd.get("line_height") or 0)
+        if lh <= 0:
+            return
+        fw = int(dd.get("float_w") or 0)
+        gap = int(dd.get("gap") or 0)
+        fill = ctx.resolve_color(node.props)
+        side_x = box.x + fw + gap
+        sy = box.y
+        for i, ln in enumerate(dd.get("side_lines") or []):
+            ctx.draw.text((side_x, sy + i * lh), ln, fill=fill, font=font)
+        below = dd.get("below_lines") or []
+        if below:
+            stb = int(dd.get("side_text_bottom") or 0)
+            fbg = int(dd.get("float_below_gap") or 0)
+            by = box.y + stb + fbg
+            bx_shift = int(dd.get("below_x_shift") or 0)
+            below_x = box.x + bx_shift
+            for i, ln in enumerate(below):
+                ctx.draw.text((below_x, by + i * lh), ln, fill=fill, font=font)
         return
     if node.kind == "text":
         font = node.draw_data.get("font")
@@ -833,7 +980,11 @@ def _paint_component_node(ctx: RenderContext, node: ComponentNode, theme: dict, 
         align = node.props.get("align", "left")
         align_y = node.props.get("align_y", "top")
         total_height = node.draw_data.get("text_height", 0)
-        y = _component_aligned_y(box.y, box.height, total_height, align_y)
+        try:
+            ink_dy = int(node.props.get("ink_offset_y", 0) or 0)
+        except (TypeError, ValueError):
+            ink_dy = 0
+        y = _component_aligned_y(box.y, box.height, total_height, align_y) + ink_dy
         for line in lines:
             bbox = font.getbbox(line)
             line_width = bbox[2] - bbox[0]
@@ -919,6 +1070,12 @@ def _paint_component_node(ctx: RenderContext, node: ComponentNode, theme: dict, 
             ctx.draw.text((title_x, title_y), title, fill=ctx.resolve_color(node.props), font=title_font)
     for child in node.children:
         _paint_component_node(ctx, child, theme, scale)
+    if node.props.get("border") and box.width > 0 and box.height > 0:
+        bw = _scaled_value(node.props.get("border_width"), scale, 1, 1)
+        ctx.draw.rectangle(
+            [box.x, box.y, box.x + box.width - 1, box.y + box.height - 1],
+            outline=EINK_FG, width=bw,
+        )
 
 
 def _render_component_tree_mode(
@@ -932,6 +1089,7 @@ def _render_component_tree_mode(
     screen_h: int,
     status_bar_bottom: int,
     footer_height: int,
+    footer_top_offset: int = 0,
     colors: int,
 ) -> RenderContext:
     ctx = RenderContext(
@@ -942,9 +1100,10 @@ def _render_component_tree_mode(
         screen_h=screen_h,
         y=status_bar_bottom,
         footer_height=footer_height,
+        footer_top_offset=footer_top_offset,
         colors=colors,
     )
-    scale = ctx.scale
+    scale = _component_tree_scale(ctx, theme)
     root = _build_component_node(body_tree, content)
     available_height = max(0, ctx.footer_top - status_bar_bottom)
     _measure_component_node(root, screen_w, theme, scale)
@@ -957,6 +1116,118 @@ def _render_component_tree_mode(
     if debug_overlay:
         _paint_component_debug_overlay(ctx, root)
     return ctx
+
+
+# ── Decorations ──────────────────────────────────────────────
+
+
+def _load_decoration_image(
+    name: str, size: tuple[int, int], *,
+    image_mode: str = "auto", dither: bool = False,
+) -> Image.Image | None:
+    """Load a decoration image, converting to 1-bit for e-ink display.
+
+    image_mode controls the processing algorithm:
+      "circle"        - crop to circle with border, keep content inside
+      "invert"        - invert colors (for dark-bg icons with white content)
+      "invert_dither" - dither then invert bg to white (best for dark-bg detail)
+      "color_dither"  - remove colored bg via floodfill then dither (colored-bg icons)
+      "auto"          - threshold/dither with transparent white areas
+    """
+    path = _BACKEND_ROOT / "fonts" / "icons" / f"{name}.png"
+    if not path.exists():
+        return None
+    src = Image.open(path).convert("RGBA")
+    src = src.resize(size, Image.LANCZOS)
+    w, h = size
+    gray = src.convert("L")
+
+    if image_mode == "circle":
+        from PIL import ImageDraw as PilDraw
+        r = min(w, h) // 2
+        cx, cy = w // 2, h // 2
+        circle_mask = Image.new("L", size, 0)
+        md = PilDraw.Draw(circle_mask)
+        md.ellipse((cx - r, cy - r, cx + r, cy + r), fill=255)
+        content = gray.point(lambda v: 0 if v < 192 else 255, "1")
+        result = Image.new("1", size, 1)
+        result.paste(content, mask=circle_mask)
+        rd = ImageDraw.Draw(result)
+        rd.ellipse((cx - r, cy - r, cx + r, cy + r), outline=0, width=1)
+        return result
+
+    if image_mode == "invert":
+        inverted = gray.point(lambda v: 0 if v > 128 else 255, "1")
+        alpha = gray.point(lambda v: 255 if v > 64 else 0, "L")
+        result = Image.new("1", size, 1)
+        result.paste(inverted, mask=alpha)
+        return result
+
+    if image_mode == "invert_dither":
+        from PIL import ImageDraw as PilDraw
+        clean = gray.copy()
+        for corner in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]:
+            if clean.getpixel(corner) < 30:
+                PilDraw.floodfill(clean, corner, 255, thresh=30)
+        return clean.convert("1")
+
+    if image_mode == "color_dither":
+        from PIL import ImageDraw as PilDraw
+        clean = gray.copy()
+        bg_val = sum(clean.getpixel(c) for c in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]) // 4
+        thresh = 40
+        for corner in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]:
+            if abs(clean.getpixel(corner) - bg_val) <= thresh:
+                PilDraw.floodfill(clean, corner, 255, thresh=thresh)
+        return clean.convert("1")
+
+    if dither:
+        mono = gray.convert("1")
+        alpha = gray.point(lambda v: 255 if v < 220 else 0, "L")
+    else:
+        mono = gray.point(lambda v: 0 if v < 128 else 255, "1")
+        alpha = gray.point(lambda v: 255 if v < 200 else 0, "1")
+    result = Image.new("1", size, 1)
+    result.paste(mono, mask=alpha)
+    return result
+
+
+def _apply_decorations(
+    img: Image.Image,
+    decorations: list[dict],
+    screen_w: int,
+    screen_h: int,
+    status_bar_bottom: int,
+) -> None:
+    """Paste decoration images at absolute positions."""
+    if not decorations:
+        return
+    scale = screen_w / 400.0
+    for dec in decorations:
+        icon_name = dec.get("icon")
+        if not icon_name:
+            continue
+        size = int(dec.get("size", 36) * scale)
+        dither = dec.get("dither", False)
+        image_mode = dec.get("image_mode", "auto")
+        dec_img = _load_decoration_image(
+            icon_name, (size, size), image_mode=image_mode, dither=dither,
+        )
+        if dec_img is None:
+            continue
+        margin = int(dec.get("margin", 8) * scale)
+        anchor = dec.get("anchor", "top_left")
+        if anchor == "top_left":
+            x, y = margin, status_bar_bottom + margin
+        elif anchor == "top_right":
+            x, y = screen_w - size - margin, status_bar_bottom + margin
+        elif anchor == "bottom_left":
+            x, y = margin, screen_h - size - margin
+        elif anchor == "bottom_right":
+            x, y = screen_w - size - margin, screen_h - size - margin
+        else:
+            x, y = margin, status_bar_bottom + margin
+        paste_icon_onto(img, dec_img, (x, y))
 
 
 # ── Public API ───────────────────────────────────────────────
@@ -993,23 +1264,49 @@ def render_json_mode(
     layout = expand_layout_presets(layout)
 
     sb = layout.get("status_bar", {})
-    draw_status_bar(
-        draw, img, date_str, weather_str, int(battery_pct), weather_code,
+    ft_layout = layout.get("footer", {})
+    status_bar_pct = 0.10 if screen_h < 200 else 0.12
+    # 296×128：旧 draw_status_bar 横线在 int(h*0.11)（约 14px）；若用 int(h*0.10)+2 与之相同，视觉上“没下移”
+    if screen_h <= 128:
+        status_bar_bottom = int(screen_h * 0.11) + 2
+    else:
+        status_bar_bottom = int(screen_h * status_bar_pct)
+
+    _dsb_kw: dict[str, Any] = dict(
+        draw=draw,
+        img=img,
+        date_str=date_str,
+        weather_str=weather_str,
+        battery_pct=int(battery_pct),
+        weather_code=weather_code,
         line_width=sb.get("line_width", 1),
         dashed=sb.get("dashed", False),
         time_str=time_str,
-        screen_w=screen_w, screen_h=screen_h,
+        screen_w=screen_w,
+        screen_h=screen_h,
         colors=colors,
         language=language,
     )
+    if screen_h <= 128:
+        _dsb_kw["separator_y"] = status_bar_bottom
+    draw_status_bar(**_dsb_kw)
 
-    ft_layout = layout.get("footer", {})
-    status_bar_pct = 0.10 if screen_h < 200 else 0.12
-    status_bar_bottom = int(screen_h * status_bar_pct)
     scale = screen_w / 400.0
+    if scale < 0.92:
+        scale = 0.92
     min_scale = min(scale, screen_h / 300.0)
+    if min_scale < 0.65:
+        min_scale = 0.65
     footer_height = int(ft_layout.get("height", 30) * min_scale)
+    # 2.9"（128px 高等）：页脚要容纳图标 + 左右文案，缩放后仍须足够高度，否则会贴底
+    if screen_h <= 128:
+        footer_height = max(footer_height, 24)
     footer_top = screen_h - footer_height
+    # 页脚顶部分隔线相对「内容上边界」下移 2–3px，与 draw_footer(y_line) 一致
+    footer_top_offset = 0
+    if screen_h <= 128:
+        footer_top_offset = 3
+        footer_top += footer_top_offset
 
     body = layout.get("body", [])
     if _uses_component_tree(body, layout):
@@ -1026,6 +1323,7 @@ def render_json_mode(
             screen_h=screen_h,
             status_bar_bottom=status_bar_bottom,
             footer_height=footer_height,
+            footer_top_offset=footer_top_offset,
             colors=colors,
         )
     else:
@@ -1039,7 +1337,7 @@ def render_json_mode(
             ctx = RenderContext(
                 draw=draw, img=img, content=content,
                 screen_w=screen_w, screen_h=screen_h,
-                y=status_bar_bottom, footer_height=footer_height, colors=colors,
+                y=status_bar_bottom, footer_height=footer_height, footer_top_offset=footer_top_offset, colors=colors,
             )
             _render_centered_text(ctx, body[0], use_full_body=True)
         elif body_align == "center" and body:
@@ -1047,7 +1345,7 @@ def render_json_mode(
             measure_ctx = RenderContext(
                 draw=ImageDraw.Draw(measure_img), img=measure_img, content=content,
                 screen_w=screen_w, screen_h=screen_h,
-                y=status_bar_bottom, footer_height=footer_height,
+                y=status_bar_bottom, footer_height=footer_height, footer_top_offset=footer_top_offset,
             )
             apply_text_fontmode(measure_ctx.draw)
             for block in body:
@@ -1061,7 +1359,8 @@ def render_json_mode(
             ctx = RenderContext(
                 draw=draw, img=img, content=content,
                 screen_w=screen_w, screen_h=screen_h,
-                y=status_bar_bottom + offset, footer_height=footer_height, colors=colors,
+                y=status_bar_bottom + offset, footer_height=footer_height, footer_top_offset=footer_top_offset,
+                colors=colors,
             )
             for block in body:
                 if ctx.y >= footer_top - 10:
@@ -1071,12 +1370,14 @@ def render_json_mode(
             ctx = RenderContext(
                 draw=draw, img=img, content=content,
                 screen_w=screen_w, screen_h=screen_h,
-                y=status_bar_bottom, footer_height=footer_height, colors=colors,
+                y=status_bar_bottom, footer_height=footer_height, footer_top_offset=footer_top_offset, colors=colors,
             )
             for block in body:
                 if ctx.y >= footer_top - 10:
                     break
                 _render_block(ctx, block)
+
+    _apply_decorations(img, layout.get("decorations", []), screen_w, screen_h, status_bar_bottom)
 
     ft = ft_layout
     mode_id = mode_def.get("mode_id", "")
@@ -1095,6 +1396,7 @@ def render_json_mode(
         attr_font_size=_attr_font_size,
         screen_w=screen_w, screen_h=screen_h,
         colors=colors,
+        footer_top=footer_top,
     )
 
     return img
@@ -1183,10 +1485,15 @@ def _render_text(ctx: RenderContext, block: dict) -> None:
         return
 
     font_size = int(block.get("font_size", 14) * ctx.scale)
+    font_name = block.get("font_name")
     font_key = block.get("font", "noto_serif_regular")
-    if has_cjk(text):
+    if font_name and not has_cjk(text):
+        font = load_font_by_name(font_name, font_size)
+    elif has_cjk(text):
         font_key = _pick_cjk_font(font_key)
-    font = load_font(font_key, font_size)
+        font = load_font(font_key, font_size)
+    else:
+        font = load_font(font_key, font_size)
 
     align = block.get("align", "center")
     margin_x = block.get("margin_x")
@@ -1228,7 +1535,16 @@ def _render_text(ctx: RenderContext, block: dict) -> None:
         ctx.draw.text((x, line_y), line, fill=ctx.resolve_color(block), font=font)
         rendered_lines += 1
     if rendered_lines:
-        ctx.y = start_y + (rendered_lines - 1) * line_height + last_line_h
+        used_h = (rendered_lines - 1) * line_height + last_line_h
+        if block.get("reserve_line_height"):
+            used_h = max(used_h, rendered_lines * line_height)
+        min_height = block.get("min_height")
+        if min_height is not None:
+            used_h = max(used_h, int(min_height * ctx.scale))
+        ctx.y = start_y + used_h
+        margin_bottom = block.get("margin_bottom")
+        if margin_bottom is not None:
+            ctx.y += int(margin_bottom * ctx.scale)
 
 
 def _render_separator(ctx: RenderContext, block: dict) -> None:
@@ -1423,7 +1739,79 @@ def _render_conditional(ctx: RenderContext, block: dict) -> None:
 
 
 def _render_spacer(ctx: RenderContext, block: dict) -> None:
-    ctx.y += int(block.get("height", 12) * ctx.min_scale)
+    # Use horizontal scale like font_size/margins—not min_scale (which clamps hard on low
+    # heights and makes small height tweaks round to negligible pixel deltas).
+    if block.get("height_px") is not None:
+        try:
+            ctx.y += max(0, int(block["height_px"]))
+        except (TypeError, ValueError):
+            ctx.y += 0
+        return
+    try:
+        h = float(block.get("height", 12))
+    except (TypeError, ValueError):
+        h = 12.0
+    ctx.y += max(0, int(round(h * ctx.scale)))
+
+
+def _render_rating_choices(ctx: RenderContext, block: dict) -> None:
+    labels = block.get("labels") or ["忘了", "模糊", "记住"]
+    if not isinstance(labels, list) or not labels:
+        return
+
+    try:
+        selected = int(ctx.get_field(block.get("selected_field", "rating_cursor")) or 0)
+    except (TypeError, ValueError):
+        selected = 0
+    selected %= len(labels)
+
+    font_size = int(block.get("font_size", 14) * ctx.scale)
+    font_key = block.get("font", "noto_serif_regular")
+    if any(has_cjk(str(label)) for label in labels):
+        font_key = _pick_cjk_font(font_key)
+    font = load_font(font_key, font_size)
+
+    margin_x = int(block.get("margin_x", 26) * ctx.scale)
+    gap = int(block.get("gap", 8) * ctx.scale)
+    height = int(block.get("height", 24) * ctx.scale)
+    outline_width = max(1, int(block.get("line_width", 1) * ctx.scale))
+    margin_bottom = int(block.get("margin_bottom", 6) * ctx.scale)
+    selected_style = str(block.get("selected_style", "fill")).lower()
+
+    count = len(labels)
+    total_w = max(20, ctx.available_width - margin_x * 2)
+    chip_w = max(12, (total_w - gap * (count - 1)) // count)
+    y = ctx.y
+    x = ctx.x_offset + margin_x
+
+    for i, raw_label in enumerate(labels):
+        label = str(raw_label)
+        x0 = x + i * (chip_w + gap)
+        x1 = x0 + chip_w
+        y1 = y + height
+        is_selected = i == selected
+        if is_selected and selected_style != "cursor":
+            ctx.draw.rectangle([x0, y, x1, y1], fill=EINK_FG)
+            text_fill = EINK_BG
+        else:
+            ctx.draw.rectangle([x0, y, x1, y1], outline=EINK_FG, width=outline_width)
+            text_fill = EINK_FG
+
+        bbox = font.getbbox(label)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        tx = x0 + (chip_w - text_w) // 2 - bbox[0]
+        ty = y + (height - text_h) // 2 - bbox[1]
+        ctx.draw.text((tx, ty), label, fill=text_fill, font=font)
+        if is_selected and selected_style == "cursor":
+            marker_w = max(6, int(block.get("cursor_width", 12) * ctx.scale))
+            marker_h = max(2, int(block.get("cursor_height", 3) * ctx.scale))
+            marker_gap = max(1, int(block.get("cursor_gap", 2) * ctx.scale))
+            mx0 = x0 + (chip_w - marker_w) // 2
+            my0 = max(y + 1, y1 - marker_h - marker_gap)
+            ctx.draw.rectangle([mx0, my0, mx0 + marker_w, my0 + marker_h], fill=EINK_FG)
+
+    ctx.y = y + height + margin_bottom
 
 
 def _render_icon_text(ctx: RenderContext, block: dict) -> None:
@@ -1524,7 +1912,39 @@ def _render_weather_icon_text(ctx: RenderContext, block: dict) -> None:
 
     ctx.draw.text((x - bbox[0], y - bbox[1] + text_y_offset), text, fill=ctx.resolve_color(block), font=font)
     text_height = bbox[3] - bbox[1]
-    ctx.y += max(icon_size, text_height) + margin_bottom
+    text_ink_left = x - bbox[0]
+    text_w = bbox[2] - bbox[0]
+
+    suffix_field = block.get("suffix_field")
+    suffix_gap = int(block.get("suffix_gap", 8) * ctx.scale)
+    suffix_font_size_raw = block.get("suffix_font_size")
+    suffix_sz = (
+        int(suffix_font_size_raw * ctx.scale)
+        if suffix_font_size_raw is not None
+        else font_size
+    )
+    suffix_font_key = block.get("suffix_font", font_key)
+
+    suffix_height = 0
+    if suffix_field and align == "left":
+        suffix_text_raw = str(ctx.get_field(suffix_field)).strip()
+        if suffix_text_raw:
+            suf_font_k = suffix_font_key
+            if has_cjk(suffix_text_raw):
+                suf_font_k = _pick_cjk_font(suf_font_k)
+            sfont = load_font(suf_font_k, suffix_sz)
+            sbox = sfont.getbbox(suffix_text_raw)
+            suffix_height = sbox[3] - sbox[1]
+            suf_x = text_ink_left + text_w + suffix_gap - sbox[0]
+            suf_y_in = y - sbox[1] + text_y_offset
+            ctx.draw.text((suf_x, suf_y_in), suffix_text_raw, fill=ctx.resolve_color(block), font=sfont)
+
+    row_draw_h = max(
+        icon_size + max(0, icon_y_offset) if icon_present else 0,
+        text_height + abs(text_y_offset),
+        suffix_height + abs(text_y_offset),
+    )
+    ctx.y += row_draw_h + margin_bottom
 
 
 def _render_big_number(ctx: RenderContext, block: dict) -> None:
@@ -1827,9 +2247,44 @@ def _render_forecast_cards(ctx: RenderContext, block: dict) -> None:
     ctx.y = card_bottom_max + margin_bottom
 
 
+def _measure_column_blocks_height(
+    ctx: RenderContext,
+    blocks: list,
+    *,
+    x_offset: int,
+    available_width: int,
+) -> int:
+    """Total vertical advance Y if ``blocks`` were rendered at y=0 (off-screen bitmap). Used for valign in two_column."""
+    if not blocks:
+        return 0
+    w, h = max(1, ctx.screen_w), max(1, ctx.screen_h)
+    measure_img = Image.new("1", (w, h), EINK_BG)
+    measure_draw = ImageDraw.Draw(measure_img)
+    apply_text_fontmode(measure_draw)
+    mc = RenderContext(
+        draw=measure_draw,
+        img=measure_img,
+        content=ctx.content,
+        screen_w=ctx.screen_w,
+        screen_h=ctx.screen_h,
+        y=0,
+        x_offset=x_offset,
+        available_width=available_width,
+        footer_height=ctx.footer_height,
+        footer_top_offset=ctx.footer_top_offset,
+        colors=ctx.colors,
+    )
+    for child in blocks:
+        if mc.y >= ctx.footer_top - 10:
+            break
+        _render_block(mc, child)
+    return max(0, mc.y)
+
+
 def _render_two_column(ctx: RenderContext, block: dict) -> None:
-    # Auto-downgrade to single column on very short screens
-    if ctx.screen_h < 200:
+    # Very short screens: stack left then right vertically (saves horizontal space was wrong on 296-wide).
+    # Weather 296x128 passes stack_when_short: false for a true split column layout.
+    if ctx.screen_h < 200 and block.get("stack_when_short", True):
         for child in block.get("left", []):
             if ctx.y >= ctx.footer_top - 10:
                 break
@@ -1844,22 +2299,65 @@ def _render_two_column(ctx: RenderContext, block: dict) -> None:
     gap = int(block.get("gap", 8) * ctx.scale)
     left_x = int(block.get("left_x", 0) * ctx.scale) + ctx.x_offset
     right_x = left_x + left_width + gap
+    right_avail = max(0, ctx.screen_w - right_x)
+    lv = str(block.get("left_valign", "top") or "top").lower()
+    rv = str(block.get("right_valign", "top") or "top").lower()
+    measure_valign = any(v in ("center", "bottom") for v in (lv, rv))
+
+    row_y0 = ctx.y
+    left_h = right_h = 0
+    if measure_valign:
+        left_h = _measure_column_blocks_height(
+            ctx, block.get("left", []), x_offset=left_x, available_width=left_width
+        )
+        right_h = _measure_column_blocks_height(
+            ctx, block.get("right", []), x_offset=right_x, available_width=right_avail
+        )
+    row_h_base = max(left_h, right_h) if measure_valign else 0
+    row_min_design = block.get("row_min_height")
+    if measure_valign and row_min_design is not None:
+        try:
+            row_h = max(row_h_base, int(float(row_min_design) * ctx.scale))
+        except (TypeError, ValueError):
+            row_h = row_h_base
+    else:
+        row_h = row_h_base
+
+    left_extra_px = int(block.get("left_offset_px") or 0)
+    right_extra_px = int(block.get("right_offset_px") or 0)
+
+    def _valign_delta(content_h: int, mode: str) -> int:
+        if not measure_valign or mode == "top":
+            return 0
+        if mode == "center":
+            return max(0, (row_h - content_h) // 2)
+        if mode == "bottom":
+            return max(0, row_h - content_h)
+        return 0
+
+    left_dy = _valign_delta(left_h, lv) + left_extra_px
+    right_dy = _valign_delta(right_h, rv) + right_extra_px
+
     left_ctx = RenderContext(
         draw=ctx.draw, img=ctx.img, content=ctx.content,
-        screen_w=ctx.screen_w, screen_h=ctx.screen_h, y=ctx.y,
+        screen_w=ctx.screen_w, screen_h=ctx.screen_h, y=row_y0 + left_dy,
         x_offset=left_x, available_width=left_width,
         footer_height=ctx.footer_height,
+        footer_top_offset=ctx.footer_top_offset,
     )
     right_ctx = RenderContext(
         draw=ctx.draw, img=ctx.img, content=ctx.content,
-        screen_w=ctx.screen_w, screen_h=ctx.screen_h, y=ctx.y,
-        x_offset=right_x, available_width=max(0, ctx.screen_w - right_x),
+        screen_w=ctx.screen_w, screen_h=ctx.screen_h, y=row_y0 + right_dy,
+        x_offset=right_x, available_width=right_avail,
         footer_height=ctx.footer_height,
+        footer_top_offset=ctx.footer_top_offset,
     )
     for child in block.get("left", []):
         _render_block(left_ctx, child)
     for child in block.get("right", []):
         _render_block(right_ctx, child)
+    # row_h / valign only offsets children; advancing ctx.y by row_y0+row_h would reserve
+    # blank space below the columns and clip following body blocks (e.g. WEATHER advice on 296x128).
     ctx.y = max(left_ctx.y, right_ctx.y)
 
 
@@ -1979,12 +2477,27 @@ def _render_icon_list(ctx: RenderContext, block: dict) -> None:
 
 def _resolve_local_asset(url: str) -> str | None:
     """Resolve known local URLs to local filesystem paths."""
-    if url.startswith("/webconfig/"):
-        project_root = Path(__file__).resolve().parent.parent.parent
-        local = project_root / "webconfig" / url[len("/webconfig/"):]
-        if local.exists() and local.is_file():
+    backend_root = Path(__file__).resolve().parent.parent
+    repo_root = backend_root.parent
+
+    def _resolve_under(root: Path, rel_path: str) -> str | None:
+        root = root.resolve()
+        local = (root / rel_path).resolve()
+        try:
+            local.relative_to(root)
+        except ValueError:
+            return None
+        if local != root and local.exists() and local.is_file():
             return str(local)
         return None
+
+    if url.startswith("/static/"):
+        return _resolve_under(backend_root / "static", url[len("/static/"):])
+    if url.startswith("/webconfig/"):
+        legacy_path = url[len("/webconfig/"):]
+        if legacy_path.startswith("assets/art/"):
+            return _resolve_under(backend_root / "static" / "art", legacy_path[len("assets/art/"):])
+        return _resolve_under(repo_root / "webconfig", legacy_path)
     try:
         parsed = urlparse(url)
     except ValueError:
@@ -2004,6 +2517,26 @@ def _resolve_local_asset(url: str) -> str | None:
     return None
 
 
+def _is_upload_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    path = parsed.path or url
+    return path.startswith("/api/uploads/")
+
+
+def _draw_image_placeholder(ctx: RenderContext, x: int, y: int, width: int, height: int, text: str) -> None:
+    ctx.draw.rectangle([x, y, x + width, y + height], outline=EINK_FG, width=1)
+    placeholder_font = load_font("noto_serif_light", int(12 * ctx.scale))
+    bbox = placeholder_font.getbbox(text)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    tx = x + (width - tw) // 2
+    ty = y + (height - th) // 2
+    ctx.draw.text((tx, ty), text, fill=EINK_FG, font=placeholder_font)
+
+
 def _render_image(ctx: RenderContext, block: dict) -> None:
     field_name = block.get("field", "image_url")
     image_url = str(ctx.get_field(field_name) or "")
@@ -2016,12 +2549,22 @@ def _render_image(ctx: RenderContext, block: dict) -> None:
     fit = str(block.get("fit", "fill") or "fill")
     align_x = str(block.get("align_x", "center") or "center")
     align_y = str(block.get("align_y", "center") or "center")
+    photo_enhance = bool(block.get("photo_enhance", False))
     margin_bottom = int(block.get("margin_bottom", 6) * ctx.scale)
     # Try pre-fetched data first (async download from json_content.py)
     prefetched = ctx.content.get(f"_prefetched_{field_name}")
     if prefetched:
         from io import BytesIO
-        img = _convert_image_block(Image.open(BytesIO(prefetched)), width, height, ctx.colors, fit=fit, align_x=align_x, align_y=align_y)
+        img = convert_image_block(
+            Image.open(BytesIO(prefetched)),
+            width,
+            height,
+            ctx.colors,
+            fit=fit,
+            align_x=align_x,
+            align_y=align_y,
+            photo_enhance=photo_enhance,
+        )
         if ctx.colors >= 3:
             ctx.img.paste(img, (x, y))
         else:
@@ -2031,7 +2574,16 @@ def _render_image(ctx: RenderContext, block: dict) -> None:
     local_path = _resolve_local_asset(image_url)
     if local_path:
         try:
-            img = _convert_image_block(Image.open(local_path), width, height, ctx.colors, fit=fit, align_x=align_x, align_y=align_y)
+            img = convert_image_block(
+                Image.open(local_path),
+                width,
+                height,
+                ctx.colors,
+                fit=fit,
+                align_x=align_x,
+                align_y=align_y,
+                photo_enhance=photo_enhance,
+            )
             if ctx.colors >= 3:
                 ctx.img.paste(img, (x, y))
             else:
@@ -2040,6 +2592,11 @@ def _render_image(ctx: RenderContext, block: dict) -> None:
             return
         except (OSError, UnidentifiedImageError):
             logger.warning("[JSONRenderer] Failed to load local asset %s", local_path, exc_info=True)
+    elif _is_upload_url(image_url):
+        logger.warning("[JSONRenderer] Uploaded image link expired: %s", image_url)
+        _draw_image_placeholder(ctx, x, y, width, height, "Image link expired")
+        ctx.y = y + height + margin_bottom
+        return
     try:
         resp = None
         last_error = None
@@ -2064,23 +2621,24 @@ def _render_image(ctx: RenderContext, block: dict) -> None:
         if resp is None:
             raise last_error if last_error else ValueError("image fetch failed")
         from io import BytesIO
-        img = _convert_image_block(Image.open(BytesIO(resp.content)), width, height, ctx.colors, fit=fit, align_x=align_x, align_y=align_y)
+        img = convert_image_block(
+            Image.open(BytesIO(resp.content)),
+            width,
+            height,
+            ctx.colors,
+            fit=fit,
+            align_x=align_x,
+            align_y=align_y,
+            photo_enhance=photo_enhance,
+        )
         if ctx.colors >= 3:
             ctx.img.paste(img, (x, y))
         else:
             ctx.paste_icon(img, (x, y))
         ctx.y = y + height + margin_bottom
     except (httpx.HTTPError, ValueError, OSError, UnidentifiedImageError):
-        logger.warning("[JSONRenderer] Failed to render image block", exc_info=True)
-        ctx.draw.rectangle([x, y, x + width, y + height], outline=EINK_FG, width=1)
-        placeholder_font = load_font("noto_serif_light", int(12 * ctx.scale))
-        placeholder_text = "Image unavailable"
-        bbox = placeholder_font.getbbox(placeholder_text)
-        tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
-        tx = x + (width - tw) // 2
-        ty = y + (height - th) // 2
-        ctx.draw.text((tx, ty), placeholder_text, fill=EINK_FG, font=placeholder_font)
+        logger.warning("[JSONRenderer] Failed to render image block: %s", image_url, exc_info=True)
+        _draw_image_placeholder(ctx, x, y, width, height, "Image link expired")
         ctx.y = y + height + int(block.get("margin_bottom", 6) * ctx.scale)
 
 
@@ -2103,15 +2661,89 @@ def _num(v: Any) -> float:
         return 0.0
 
 
+def _calendar_cell_day_str(cell: Any) -> str:
+    if cell is None:
+        return ""
+    return str(cell).strip()
+
+
+def _calendar_row_contains_day(row: Any, day: str) -> bool:
+    if not isinstance(row, list):
+        return False
+    t = str(day).strip()
+    if not t:
+        return False
+    return any(_calendar_cell_day_str(c) == t for c in row)
+
+
+def _calendar_has_leading_carry_row(norm: list[Any]) -> bool:
+    """True when row 0 is a prior-month tail row and row 1 starts the month's days (has day 1)."""
+    if len(norm) < 2:
+        return False
+    return not _calendar_row_contains_day(norm[0], "1") and _calendar_row_contains_day(
+        norm[1], "1"
+    )
+
+
+def slice_calendar_rows_around_day(rows: list[Any], today: str, *, max_rows: int) -> list[Any]:
+    """Return at most ``max_rows`` week-rows so ``today`` appears when possible.
+
+    Rules (``max_rows`` == 2):
+    - Today's week is row 1 of the month: show rows 1–2.
+    - Today's week is neither first nor last: show that row and the next row.
+      If the grid has a leading previous-month row followed by the week that
+      contains day 1, shift the window up by one so week 1 stays visible with
+      today's week.
+    - Today's week is the last row: show the previous row and the last row.
+    """
+    if max_rows < 1 or not rows:
+        return rows
+    norm: list[Any] = [r if isinstance(r, list) else [] for r in rows]
+    n = len(norm)
+    if n <= max_rows:
+        return norm[:]
+    t = str(today).strip()
+    idx: int | None = None
+    for i, row in enumerate(norm):
+        if _calendar_row_contains_day(row, t):
+            idx = i
+            break
+    if idx is None:
+        return norm[:max_rows]
+    if idx == 0:
+        start = 0
+    elif idx >= n - 1:
+        start = max(0, n - max_rows)
+    elif (
+        max_rows == 2
+        and 2 <= idx < n - 1
+        and _calendar_has_leading_carry_row(norm)
+    ):
+        # Extra week row from the previous month above row 1: keep "week of day 1" + today week
+        # (avoids jumping past the first full month week when the match index shifts by +1).
+        start = idx - 1
+    else:
+        start = idx
+    return norm[start : start + max_rows]
+
+
 def _render_calendar_grid(ctx: RenderContext, block: dict) -> None:
     """Render a 7-column monthly calendar grid with today highlight and sub-labels."""
-    rows = ctx.get_field(block.get("rows_field", "calendar_rows"))
+    rows_raw = ctx.get_field(block.get("rows_field", "calendar_rows"))
+    rows = rows_raw if isinstance(rows_raw, list) else []
     headers = ctx.get_field(block.get("headers_field", "weekday_headers"))
     today = str(ctx.get_field(block.get("today_field", "today_day")))
     day_labels = ctx.get_field(block.get("labels_field", "day_labels")) or {}
     day_label_types = ctx.get_field(block.get("label_types_field", "day_label_types")) or {}
     if not isinstance(rows, list) or not isinstance(headers, list):
         return
+    mr_raw = block.get("max_rows")
+    if mr_raw is not None:
+        try:
+            rows = slice_calendar_rows_around_day(rows, today, max_rows=max(1, int(mr_raw)))
+        except (TypeError, ValueError):
+            pass
+
     if not isinstance(day_labels, dict):
         day_labels = {}
     if not isinstance(day_label_types, dict):
@@ -2162,16 +2794,17 @@ def _render_calendar_grid(ctx: RenderContext, block: dict) -> None:
         if ctx.y + cell_h > ctx.footer_top - 10:
             break
         for ci, day_str in enumerate(row[:7]):
-            if not day_str:
+            ds = _calendar_cell_day_str(day_str)
+            if not ds:
                 continue
             cx = x0 + ci * cell_w + cell_w // 2
-            bbox = font.getbbox(day_str)
+            bbox = font.getbbox(ds)
             tw = bbox[2] - bbox[0]
             th = bbox[3] - bbox[1]
             tx = cx - tw // 2
             ty = ctx.y
 
-            if day_str == today:
+            if ds == str(today).strip():
                 r = max(tw, th) // 2 + today_padding
                 cy = ty + th // 2 + int(2 * ctx.scale)
                 ec = (cx - r, cy - r, cx + r, cy + r)
@@ -2181,14 +2814,14 @@ def _render_calendar_grid(ctx: RenderContext, block: dict) -> None:
                     pass
                 else:
                     ctx.draw.ellipse(ec, fill=today_bg)
-                ctx.draw.text((tx, ty), day_str, fill=today_text_color if today_style != "none" else EINK_FG, font=font)
+                ctx.draw.text((tx, ty), ds, fill=today_text_color if today_style != "none" else EINK_FG, font=font)
             else:
                 color = weekend_color if ci >= weekend_start else EINK_FG
-                ctx.draw.text((tx, ty), day_str, fill=color, font=font)
+                ctx.draw.text((tx, ty), ds, fill=color, font=font)
 
-            sub = day_labels.get(day_str, "")
+            sub = day_labels.get(ds, "")
             if show_day_labels and sub:
-                lt = day_label_types.get(day_str, "lunar")
+                lt = day_label_types.get(ds, "lunar")
                 label_font = reminder_font if lt == "reminder" else sub_font
                 sb = label_font.getbbox(sub)
                 sw = sb[2] - sb[0]
@@ -2254,10 +2887,10 @@ def _render_timetable_daily(ctx: RenderContext, block: dict) -> None:
         is_current = slot.get(current_field, False)
         loc = str(slot.get(location_field, ""))
 
-        if is_current and ctx.colors >= 3:
+        if is_current:
             ctx.draw.rectangle(
                 [x0, ctx.y, x0 + grid_w, ctx.y + row_h - 1],
-                fill=highlight_color,
+                fill=highlight_color if ctx.colors >= 3 else EINK_FG,
             )
             text_color = current_text_color
         else:
@@ -2375,7 +3008,8 @@ def _render_timetable_weekly(ctx: RenderContext, block: dict) -> None:
         row_h = max(int(16 * ctx.scale), avail_h // max(n_periods, 1))
 
     time_col_w = int(grid_w * time_col_ratio)
-    day_col_w = (grid_w - time_col_w) // 5
+    day_count = max(1, len(weekdays))
+    day_col_w = (grid_w - time_col_w) // day_count
 
     highlight_color = _resolve_named_color(ctx, block.get("highlight_color", "red"), EINK_FG)
     accent_color = _resolve_named_color(ctx, block.get("accent_color", "yellow"), EINK_FG)
@@ -2383,12 +3017,24 @@ def _render_timetable_weekly(ctx: RenderContext, block: dict) -> None:
     show_location = bool(block.get("show_location", True))
 
     hx = x0 + time_col_w
-    for di, wd_label in enumerate(weekdays[:5]):
-        cx = hx + di * day_col_w + day_col_w // 2
+    for di, wd_label in enumerate(weekdays[:day_count]):
+        cell_x = hx + di * day_col_w
+        cx = cell_x + day_col_w // 2
         bb = header_font.getbbox(wd_label)
         tw = bb[2] - bb[0]
         tx = cx - tw // 2
         color = highlight_color if di == current_day else EINK_FG
+        if di == current_day and ctx.colors < 3:
+            ctx.draw.rectangle(
+                [
+                    cell_x + 1,
+                    ctx.y,
+                    cell_x + day_col_w - 2,
+                    ctx.y + header_h - 1,
+                ],
+                fill=EINK_FG,
+            )
+            color = EINK_BG
         ctx.draw.text((tx, ctx.y), wd_label, fill=color, font=header_font)
     ctx.y += header_h
     ctx.draw.line([(x0, ctx.y), (x0 + grid_w, ctx.y)], fill=EINK_FG, width=1)
@@ -2428,23 +3074,24 @@ def _render_timetable_weekly(ctx: RenderContext, block: dict) -> None:
 
         row_data = grid[pi] if pi < len(grid) else []
 
-        for di in range(5):
+        for di in range(day_count):
             cell_x = x0 + time_col_w + di * day_col_w
             cell_text = str(row_data[di]) if di < len(row_data) else ""
 
             is_current_cell = (di == current_day and pi == current_period)
             highlight_col = (not has_time_range and di == current_day)
+            highlight_today_course_bw = (ctx.colors < 3 and di == current_day and bool(cell_text))
 
-            if is_current_cell and ctx.colors >= 3:
+            if is_current_cell or highlight_today_course_bw:
                 ctx.draw.rectangle(
                     [cell_x + 1, ctx.y, cell_x + day_col_w - 1, ctx.y + row_h - 1],
-                    fill=highlight_color,
+                    fill=highlight_color if ctx.colors >= 3 else EINK_FG,
                 )
                 text_color = current_text_color
-            elif highlight_col and ctx.colors >= 3:
+            elif highlight_col:
                 ctx.draw.rectangle(
                     [cell_x + 1, ctx.y, cell_x + day_col_w - 1, ctx.y + row_h - 1],
-                    fill=highlight_color,
+                    fill=highlight_color if ctx.colors >= 3 else EINK_FG,
                 )
                 text_color = current_text_color
             else:
@@ -2477,6 +3124,7 @@ _BLOCK_RENDERERS["list"] = _render_list
 _BLOCK_RENDERERS["vertical_stack"] = _render_vertical_stack
 _BLOCK_RENDERERS["conditional"] = _render_conditional
 _BLOCK_RENDERERS["spacer"] = _render_spacer
+_BLOCK_RENDERERS["rating_choices"] = _render_rating_choices
 _BLOCK_RENDERERS["icon_text"] = _render_icon_text
 _BLOCK_RENDERERS["weather_icon_text"] = _render_weather_icon_text
 _BLOCK_RENDERERS["two_column"] = _render_two_column

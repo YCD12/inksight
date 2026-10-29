@@ -38,6 +38,32 @@ class TestCleanJsonResponse:
     def test_whitespace_preserved(self):
         assert _clean_json_response("  hello  ") == "hello"
 
+    def test_newline_inside_string_repaired(self):
+        """LLM often splits CJK mid-phrase across a line break (invalid JSON)."""
+        raw = '{"sender": "1965", "greeting": "同志，见字如\n面", "body": "x"}'
+        cleaned = _clean_json_response(raw)
+        data = json.loads(cleaned)
+        assert data["greeting"] == "同志，见字如\n面"
+        assert "\n" in data["greeting"]
+
+    def test_curly_inner_quotes_and_newline_story_json(self):
+        """STORY-like LLM output: newline in opening + U+201C/U+201D inside twist."""
+        ql, qr = chr(0x201C), chr(0x201D)
+        raw = (
+            '{"title": "月下问盏", "opening": "孤村深夜，老农独坐槐树下\n，把酒望月。", '
+            '"twist": "忽闻天上传声：'
+            + ql
+            + "同志"
+            + qr
+            + '惊", '
+            '"ending": "拾碗。", "genre": "荒诞"}'
+        )
+        cleaned = _clean_json_response(raw)
+        data = json.loads(cleaned)
+        assert "\n" in data["opening"]
+        assert '"' in data["twist"]
+        assert ql not in data["twist"]
+
 
 class TestBuildContextStr:
     def test_basic(self):

@@ -87,6 +87,20 @@
         "height": 18
       }
     },
+    "648x480": {
+      "preset_props": {
+        "padding_x": 36,
+        "padding_y": 12,
+        "gap": 10,
+        "greeting_font_size": 17,
+        "body_font_size": 18,
+        "body_max_lines": 7,
+        "closing_font_size": 16,
+        "separator_width": 48,
+        "postscript_font_size": 12,
+        "postscript_max_lines": 2
+      }
+    },
     "800x480": {
       "preset_props": {
         "padding_x": 56,

@@ -115,14 +115,19 @@
     "296x128": {
       "preset_props": {
         "top_gap": 0,
-        "gap": 5,
+        "justify": "start",
+        "content_bias_px": 10,
+        "gap": 4,
         "title_font_size": 11,
         "author_field": null,
         "separator_width": 40,
-        "lines_limit": 4,
-        "lines_inset_x": 8,
-        "lines_font_size": 11,
+        "lines_limit": 8,
+        "lines_inset_x": 4,
+        "lines_font_size": 10,
         "lines_gap": 3,
+        "line_max_lines": 2,
+        "lines_pair_step": 2,
+        "lines_pair_separator": ", ",
         "note_field": null
       },
       "footer": {
@@ -130,6 +135,19 @@
         "attribution_template": "— {author}",
         "dashed": true,
         "height": 18
+      }
+    },
+    "648x480": {
+      "preset_props": {
+        "top_gap": 16,
+        "gap": 8,
+        "title_font_size": 18,
+        "author_font_size": 13,
+        "separator_width": 72,
+        "lines_inset_x": 32,
+        "lines_font_size": 16,
+        "lines_gap": 8,
+        "note_font_size": 11
       }
     },
     "800x480": {

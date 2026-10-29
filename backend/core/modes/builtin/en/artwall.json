@@ -9,33 +9,33 @@
     "provider": "text2image",
     "fallback": {
       "artwork_title": "Ink Muse",
-      "image_url": "/webconfig/assets/art/moyun.png",
+      "image_url": "/static/art/moyun.png",
       "description": "Today's artwork"
     },
     "fallback_pool": [
       {
         "artwork_title": "Ink Muse",
-        "image_url": "/webconfig/assets/art/moyun.png",
+        "image_url": "/static/art/moyun.png",
         "description": "Today's artwork"
       },
       {
         "artwork_title": "Mountain Dusk",
-        "image_url": "/webconfig/assets/art/shanjuqiuming.png",
+        "image_url": "/static/art/shanjuqiuming.png",
         "description": "Ink wash landscape"
       },
       {
         "artwork_title": "Bamboo Sages",
-        "image_url": "/webconfig/assets/art/zhulinqixian.png",
+        "image_url": "/static/art/zhulinqixian.png",
         "description": "Classical woodcut figures"
       },
       {
         "artwork_title": "Zen Lotus",
-        "image_url": "/webconfig/assets/art/chanyilianhua.png",
+        "image_url": "/static/art/chanyilianhua.png",
         "description": "Minimalist zen aesthetics"
       },
       {
         "artwork_title": "Cloud Drift",
-        "image_url": "/webconfig/assets/art/yunjuanyunshu.png",
+        "image_url": "/static/art/yunjuanyunshu.png",
         "description": "Black and white cloud sea"
       }
     ]
@@ -70,15 +70,26 @@
   },
   "layout_overrides": {
     "296x128": {
+      "body_align": "top",
       "body": [
+        {
+          "type": "text",
+          "field": "artwork_title",
+          "font_size": 10,
+          "align": "center",
+          "max_lines": 1,
+          "line_height": 12
+        },
+        { "type": "spacer", "height": 3 },
         {
           "type": "image",
           "field": "image_url",
-          "width": 272,
-          "height": 86,
-          "fit": "cover",
+          "width": 322,
+          "height": 77,
+          "fit": "contain",
           "align_x": "center",
-          "align_y": "center"
+          "align_y": "center",
+          "margin_bottom": 0
         }
       ],
       "footer": {
@@ -87,6 +98,7 @@
       }
     },
     "648x480": {
+      "body_align": "top",
       "body": [
         {
           "type": "text",
@@ -98,8 +110,8 @@
         {
           "type": "image",
           "field": "image_url",
-          "width": 428,
-          "height": 300,
+          "width": 400,
+          "height": 214,
           "fit": "cover",
           "align_x": "center",
           "align_y": "center"

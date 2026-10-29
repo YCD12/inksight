@@ -26,6 +26,7 @@
         "x": 0,
         "y": 36,
         "fit": "cover",
+        "photo_enhance": true,
         "align_x": "center",
         "align_y": "center",
         "margin_bottom": 0
@@ -37,15 +38,15 @@
   },
   "layout_overrides": {
     "296x128": {
+      "body_align": "top",
       "body": [
         {
           "type": "image",
           "field": "image_url",
-          "width": 296,
-          "height": 104,
-          "x": 0,
-          "y": 12,
-          "fit": "cover",
+          "width": 322,
+          "height": 99,
+          "fit": "contain",
+          "photo_enhance": true,
           "align_x": "center",
           "align_y": "center",
           "margin_bottom": 0
@@ -57,11 +58,12 @@
         {
           "type": "image",
           "field": "image_url",
-          "width": 648,
-          "height": 375,
+          "width": 400,
+          "height": 231,
           "x": 0,
           "y": 57,
           "fit": "cover",
+          "photo_enhance": true,
           "align_x": "center",
           "align_y": "center",
           "margin_bottom": 0

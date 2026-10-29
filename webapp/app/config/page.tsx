@@ -100,7 +100,7 @@ const TONE_OPTIONS = [
 ] as const;
 const PERSONA_PRESETS = ["鲁迅", "王小波", "JARVIS", "苏格拉底", "村上春树"] as const;
 
-import { queueImmediateRefreshIfOnline } from "@/lib/device-utils";
+import { calculateBatteryPct, queueImmediateRefreshIfOnline } from "@/lib/device-utils";
 
 function normalizeTone(v: unknown): string {
   if (typeof v !== "string") return "neutral";
@@ -465,7 +465,7 @@ interface PendingPreviewConfirm {
   usageSource?: string;
 }
 
-type ParamModalType = "quote" | "weather" | "memo" | "countdown" | "habit" | "lifebar" | "calendar" | "timetable";
+type ParamModalType = "quote" | "weather" | "memo" | "countdown" | "habit" | "lifebar" | "calendar" | "timetable" | "vocab";
 interface ParamModalState {
   type: ParamModalType;
   mode: string;
@@ -786,6 +786,8 @@ function ConfigPageInner() {
   const [previewStatusText, setPreviewStatusText] = useState("");
   const [previewMode, setPreviewMode] = useState("");
   const [previewColors, setPreviewColors] = useState(2);
+  const [previewWidth, setPreviewWidth] = useState(400);
+  const [previewHeight, setPreviewHeight] = useState(300);
   const [previewNoCacheOnce, setPreviewNoCacheOnce] = useState(false);
   const [previewCacheHit, setPreviewCacheHit] = useState<boolean | null>(null);
   const [previewLlmStatus, setPreviewLlmStatus] = useState<string | null>(null);
@@ -802,7 +804,7 @@ function ConfigPageInner() {
   const [quoteDraft, setQuoteDraft] = useState("");
   const [authorDraft, setAuthorDraft] = useState("");
   const [weatherDraftLocation, setWeatherDraftLocation] = useState<LocationValue>({});
-  const [memoDraft, setMemoDraft] = useState("");
+  const [memoDraft, setMemoDraft] = useState<{ title1: string; text1: string; title2: string; text2: string; title3: string; text3: string }>({ title1: "", text1: "", title2: "", text2: "", title3: "", text3: "" });
   const [countdownName, setCountdownName] = useState(isEn ? "New Year" : "元旦");
   const [countdownDate, setCountdownDate] = useState("2027-01-01");
   const [habitItems, setHabitItems] = useState(
@@ -811,7 +813,9 @@ function ConfigPageInner() {
       : [{ name: "早起", done: false }, { name: "运动", done: false }, { name: "阅读", done: false }],
   );
   const [userAge, setUserAge] = useState(30);
-  const [lifeExpectancy, setLifeExpectancy] = useState<100 | 120>(100);
+  const [lifeExpectancy, setLifeExpectancy] = useState(80);
+  const [vocabDeckId, setVocabDeckId] = useState("core_en");
+  const [vocabDailyLimit, setVocabDailyLimit] = useState(30);
   const [timetableData, setTimetableData] = useState<TimetableData>({
     style: "weekly",
     periods: ["08:00-09:30", "10:00-11:30", "14:00-15:30", "16:00-17:30"],
@@ -1018,7 +1022,7 @@ function ConfigPageInner() {
       const res = await fetch("/api/modes/custom/preview", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode_def: modeDef, mac: mac || undefined, colors: previewColors, layout_only: true }),
+        body: JSON.stringify({ mode_def: modeDef, mac: mac || undefined, colors: previewColors, w: previewWidth, h: previewHeight, layout_only: true }),
       });
       if (!res.ok) {
         setComposerPreviewUrl(null);
@@ -1184,7 +1188,7 @@ function ConfigPageInner() {
 
   const requiresParamModal = useCallback((modeId: string) => {
     const m = (modeId || "").toUpperCase();
-    return m === "WEATHER" || m === "MEMO" || m === "MY_QUOTE" || m === "COUNTDOWN" || m === "HABIT" || m === "LIFEBAR" || m === "CALENDAR" || m === "TIMETABLE";
+    return m === "WEATHER" || m === "MEMO" || m === "MY_QUOTE" || m === "COUNTDOWN" || m === "HABIT" || m === "LIFEBAR" || m === "CALENDAR" || m === "TIMETABLE" || m === "VOCAB_REVIEW";
   }, []);
 
   const openParamModal = useCallback((modeId: string, action: "preview" | "apply") => {
@@ -1195,14 +1199,27 @@ function ConfigPageInner() {
       return;
     }
     if (m === "MEMO") {
-      const existing = (modeOverrides[m]?.memo_text as string) || memoText || "";
-      setMemoDraft(existing);
+      const savedMemo = (modeOverrides[m] || {}) as Record<string, unknown>;
+      const ms = (
+        savedMemo.mode_settings && typeof savedMemo.mode_settings === "object" && !Array.isArray(savedMemo.mode_settings)
+          ? savedMemo.mode_settings
+          : savedMemo
+      ) as Record<string, string>;
+      setMemoDraft({
+        title1: ms.memo_title_1 || "",
+        text1: ms.memo_text_1 || "",
+        title2: ms.memo_title_2 || "",
+        text2: ms.memo_text_2 || "",
+        title3: ms.memo_title_3 || "",
+        text3: ms.memo_text_3 || "",
+      });
       setParamModal({ type: "memo", mode: m, action });
       return;
     }
     if (m === "MY_QUOTE") {
-      setQuoteDraft("");
-      setAuthorDraft("");
+      const savedOv = (modeOverrides[m] || {}) as Record<string, unknown>;
+      setQuoteDraft(typeof savedOv.quote === "string" ? savedOv.quote : "");
+      setAuthorDraft(typeof savedOv.author === "string" ? savedOv.author : "");
       setParamModal({ type: "quote", mode: m, action });
       return;
     }
@@ -1220,6 +1237,15 @@ function ConfigPageInner() {
       return;
     }
     if (m === "LIFEBAR") {
+      const savedOv = (modeOverrides[m] || {}) as Record<string, unknown>;
+      const savedAge = Number(savedOv.age);
+      const savedExpect = Number(savedOv.life_expect);
+      if (Number.isFinite(savedAge) && savedAge > 0) {
+        setUserAge(savedAge);
+      }
+      if ([80, 90, 100, 120].includes(savedExpect)) {
+        setLifeExpectancy(savedExpect);
+      }
       setParamModal({ type: "lifebar", mode: m, action });
       return;
     }
@@ -1232,6 +1258,7 @@ function ConfigPageInner() {
       if (existing.periods && existing.courses) {
         setTimetableData({
           style: (existing.style as "daily" | "weekly") || "daily",
+          weekdays: Array.isArray(existing.weekdays) ? existing.weekdays as string[] : undefined,
           periods: existing.periods as string[],
           courses: existing.courses as Record<string, string>,
         });
@@ -1239,7 +1266,14 @@ function ConfigPageInner() {
       setParamModal({ type: "timetable", mode: m, action });
       return;
     }
-  }, [memoText, modeOverrides]);
+    if (m === "VOCAB_REVIEW") {
+      const ov = modeOverrides[m] || {};
+      setVocabDeckId(String(ov.deck_id || "core_en"));
+      setVocabDailyLimit(Number(ov.daily_limit || 30));
+      setParamModal({ type: "vocab", mode: m, action });
+      return;
+    }
+  }, [modeOverrides]);
 
   const clearModeOverride = useCallback((modeId: string) => {
     setModeOverrides((prev) => {
@@ -1348,9 +1382,9 @@ function ConfigPageInner() {
           ? tr("配置已保存，暂时无法确认设备状态", "Settings saved, but device status is currently unavailable")
           : onlineNow
             ? (refreshQueued
-                ? tr("配置已保存，已通知设备立即刷新", "Settings saved, device notified to refresh now")
-                : tr("配置已保存，设备在线，但立即刷新通知失败", "Settings saved, device is online, but immediate refresh notification failed"))
-            : tr("配置已保存，设备当前离线，将在设备上线后生效", "Settings saved. Device is offline and will update when it comes online"),
+                ? tr("配置已保存，已通知在线设备尽快同步", "Settings saved, online device notified to sync soon")
+                : tr("配置已保存，设备在线，但同步通知失败", "Settings saved, device is online, but sync notification failed"))
+            : tr("配置已保存，设备当前不在活跃同步状态，将在设备下次上线后生效", "Settings saved. Device is not actively syncing and will update when it comes online"),
         syncResult.onlineNow === null || !refreshQueued ? "info" : "success",
       );
       setPreviewNoCacheOnce(true);
@@ -1448,6 +1482,8 @@ function ConfigPageInner() {
     if (clearSavedOverride && m === "COUNTDOWN") {
       params.set("mode_override", JSON.stringify({ countdownEvents: [] }));
       if (previewColors > 2) params.set("colors", String(previewColors));
+      params.set("w", String(previewWidth));
+      params.set("h", String(previewHeight));
       if (forceFresh) params.set("no_cache", "1");
       return { m, params, consumeNoCacheOnce };
     }
@@ -1497,12 +1533,21 @@ function ConfigPageInner() {
       if (memoCandidate) {
         params.set("memo_text", memoCandidate);
       }
+      // 传递 3 组标题+内容字段
+      const ms = (forcedModeOverride?.mode_settings || activeModeOverride.mode_settings || {}) as Record<string, string>;
+      for (const k of Object.keys(ms)) {
+        if ((k.startsWith("memo_title_") || k.startsWith("memo_text_")) && ms[k]) {
+          params.set(k, ms[k]);
+        }
+      }
     }
     if (locationChanged && effectiveLocation.city) params.set("city_override", effectiveLocation.city);
     if (previewColors > 2) params.set("colors", String(previewColors));
+    params.set("w", String(previewWidth));
+    params.set("h", String(previewHeight));
     if (forceFresh || locationChanged || hasModeOverride) params.set("no_cache", "1");
     return { m, params, consumeNoCacheOnce };
-  }, [config, currentLocation, mac, memoText, modeOverrides, previewColors, previewMode, previewNoCacheOnce, sanitizeModeOverride]);
+  }, [config, currentLocation, mac, memoText, modeOverrides, previewColors, previewWidth, previewHeight, previewMode, previewNoCacheOnce, sanitizeModeOverride]);
 
   const ownerUsername = useMemo(
     () => deviceMembers.find((member) => member.role === "owner")?.username || "",
@@ -1901,7 +1946,7 @@ function ConfigPageInner() {
       const res = await fetch("/api/modes/custom/preview", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode_def: def, mac: mac || undefined, colors: previewColors }),
+        body: JSON.stringify({ mode_def: def, mac: mac || undefined, colors: previewColors, w: previewWidth, h: previewHeight }),
       });
 
       // 额度不足：返回 402
@@ -2129,8 +2174,20 @@ function ConfigPageInner() {
       clearModeOverride(modeId);
     } else if (forcedOverride && Object.keys(forcedOverride).length > 0) {
       updateModeOverride(modeId, forcedOverride);
-      if (modeId === "MEMO" && typeof forcedOverride.memo_text === "string") {
-        setMemoText(forcedOverride.memo_text);
+      if (modeId === "MEMO" && forcedOverride) {
+        const ms = (forcedOverride.mode_settings || {}) as Record<string, string>;
+        if (!ms.memo_title_1 && !ms.memo_text_1) {
+          // 新格式字段直接在 override 顶层
+          const newMs: Record<string, string> = {};
+          for (const k of Object.keys(forcedOverride)) {
+            if (k.startsWith("memo_title_") || k.startsWith("memo_text_")) {
+              newMs[k] = String(forcedOverride[k]);
+            }
+          }
+          if (Object.keys(newMs).length > 0) {
+            forcedOverride.mode_settings = newMs;
+          }
+        }
       }
       if (modeId === "WEATHER" && typeof forcedOverride.city === "string") {
         // keep global city as-is; weather override is per-mode
@@ -2147,6 +2204,81 @@ function ConfigPageInner() {
       }
     }
   }, [clearModeOverride, handlePreview, selectedModes, showToast, toggleMode, tr, updateModeOverride]);
+
+  const saveVocabReviewSettings = useCallback(async (modeId: string, override: ModeOverride) => {
+    if (!mac) {
+      showToast(tr("请先完成刷机和配网以获取设备 MAC", "Please flash and provision to get device MAC"), "error");
+      return;
+    }
+    if (macAccessDenied) {
+      showToast(tr("你无权配置该设备", "No permission to configure this device"), "error");
+      return;
+    }
+
+    const normalizedModeId = modeId.toUpperCase();
+    const nextModeOverrides = {
+      ...modeOverrides,
+      [normalizedModeId]: sanitizeModeOverride({
+        ...(modeOverrides[normalizedModeId] || {}),
+        ...override,
+      }),
+    };
+    const normalizedModeOverrides: Record<string, ModeOverride> = Object.fromEntries(
+      Object.entries(nextModeOverrides)
+        .map(([id, ov]) => [id.toUpperCase(), sanitizeModeOverride(ov)] as const)
+        .filter(([, ov]) => Object.keys(ov).length > 0),
+    );
+
+    setSaving(true);
+    try {
+      const body: Record<string, unknown> = {
+        mac,
+        modes: Array.from(selectedModes),
+        refreshStrategy: strategy,
+        refreshInterval: refreshMin,
+        ...currentLocation,
+        modeLanguage,
+        contentTone,
+        characterTones,
+        modeOverrides: normalizedModeOverrides,
+        memoText,
+        is_focus_listening: isFocusListening,
+        always_active: alwaysActive,
+        timeSlotRules,
+      };
+      const res = await fetch("/api/config", {
+        method: "POST",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) throw new Error("Save failed");
+      setModeOverrides(normalizedModeOverrides);
+      setParamModal(null);
+      showToast(tr("背单词设置已保存", "Vocab review settings saved"), "success");
+    } catch {
+      showToast(tr("保存失败", "Save failed"), "error");
+    } finally {
+      setSaving(false);
+    }
+  }, [
+    alwaysActive,
+    characterTones,
+    contentTone,
+    currentLocation,
+    isFocusListening,
+    mac,
+    macAccessDenied,
+    memoText,
+    modeLanguage,
+    modeOverrides,
+    refreshMin,
+    sanitizeModeOverride,
+    selectedModes,
+    showToast,
+    strategy,
+    timeSlotRules,
+    tr,
+  ]);
 
   const handlePreviewFromSettings = (addToCarousel: boolean) => {
     if (!settingsMode) return;
@@ -2270,9 +2402,7 @@ function ConfigPageInner() {
   );
   const activeModeSchema = settingsMode ? (modeSchemaMap[settingsMode] || []) : [];
 
-  const batteryPct = stats?.last_battery_voltage
-    ? Math.min(100, Math.max(0, Math.round((stats.last_battery_voltage / 3.3) * 100)))
-    : null;
+  const batteryPct = calculateBatteryPct(stats?.last_battery_voltage);
   const currentDeviceMembership = userDevices.find((d) => d.mac.toUpperCase() === mac.toUpperCase()) || null;
   const denyByMembership = Boolean(mac && currentUser && !devicesLoading && !currentDeviceMembership);
   const currentUserRole = currentDeviceMembership?.role || "";
@@ -2607,10 +2737,15 @@ function ConfigPageInner() {
                     onCreateCustomMode={openCreateCustomMode}
                     previewColors={previewColors}
                     onColorsChange={setPreviewColors}
+                    previewWidth={previewWidth}
+                    previewHeight={previewHeight}
+                    onScreenSizeChange={(w, h) => { setPreviewWidth(w); setPreviewHeight(h); }}
                   />
 
                   <div ref={previewPanelRef}>
                   <EInkPreviewPanel
+                    screenW={previewWidth}
+                    screenH={previewHeight}
                     tr={tr}
                     previewModeLabel={
                       previewModeLabelOverride ||
@@ -2834,8 +2969,8 @@ function ConfigPageInner() {
                         <div className="font-medium">{tr("始终保持活跃", "Keep device always active")}</div>
                         <div className="text-xs text-ink-light mt-1">
                           {tr(
-                            "开启后，设备会持续保持活跃，不进入间歇状态或深度睡眠。",
-                            "When enabled, the device stays active continuously and will not enter interval mode or deep sleep.",
+                            "开启后，设备会持续保持活跃，不进入间歇状态或深度睡眠。设备在线时会立即生效；若设备在深睡，请先短按 BOOT 唤醒后再保存，或等待下次唤醒后生效。",
+                            "When enabled, the device stays active continuously and will not enter interval mode or deep sleep. For immediate effect, wake the device with BOOT before saving; otherwise it applies on the next wake.",
                           )}
                         </div>
                       </div>
@@ -3510,6 +3645,12 @@ function ConfigPageInner() {
                   "Upload up to 6 images. The device cycles to the next image on each refresh.",
                 )}
               </div>
+              <div className="rounded border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+                {tr(
+                  "预览或下发只会临时生效；如需下次打开仍保留这些图片，请点击页面上的“保存到设备”。",
+                  "Previewing or sending is temporary. To keep these images next time, click \"Save to Device\" on this page.",
+                )}
+              </div>
               <div className="grid grid-cols-3 gap-2">
                 {adaptiveImageUrls.map((url, i) => (
                   <div key={`${url}-${i}`} className="relative group aspect-[4/3] rounded border border-ink/15 overflow-hidden bg-paper-dark">
@@ -3592,6 +3733,8 @@ function ConfigPageInner() {
                   ? tr("日历提醒", "Calendar Reminders")
                   : paramModal.type === "timetable"
                   ? tr("课程表设置", "Timetable Settings")
+                  : paramModal.type === "vocab"
+                  ? tr("背单词设置", "Vocab Review Settings")
                   : tr("人生进度条", "Life Progress")}
               </div>
               <button className="text-ink-light hover:text-ink" onClick={() => setParamModal(null)}>
@@ -3689,24 +3832,51 @@ function ConfigPageInner() {
                 </>
               ) : paramModal.type === "memo" ? (
                 <>
-                  <div className="text-xs text-ink-light">
-                    {tr("输入便签内容，将在墨水屏上显示。", "Enter memo content to display on e-ink screen.")}
+                  <div className="text-xs text-ink-light mb-2">
+                    {tr("设置便签标题和内容（最多3组，空的组不会显示）", "Set memo titles and content (up to 3 groups, empty groups are hidden)")}
                   </div>
-                  <textarea
-                    value={memoDraft}
-                    onChange={(e) => setMemoDraft(e.target.value)}
-                    placeholder={tr("输入便签内容...", "Enter memo content...")}
-                    className="w-full rounded-sm border border-ink/20 px-3 py-2 text-sm min-h-32 bg-white"
-                    autoFocus
-                  />
+                  {([1, 2, 3] as const).map((i) => {
+                    const tKey = `title${i}` as keyof typeof memoDraft;
+                    const cKey = `text${i}` as keyof typeof memoDraft;
+                    return (
+                      <div key={i} className="space-y-1">
+                        <label className="text-xs font-medium text-ink-light">
+                          {tr(`标题 ${i}`, `Title ${i}`)}
+                          {i > 1 && <span className="text-ink-light/50 ml-1">({tr("可选", "optional")})</span>}
+                        </label>
+                        <input
+                          type="text"
+                          value={memoDraft[tKey]}
+                          onChange={(e) => setMemoDraft(prev => ({ ...prev, [tKey]: e.target.value }))}
+                          placeholder={i === 1
+                            ? tr("输入标题，如：今日待办", "e.g. Today's TODO")
+                            : tr("可选标题", "Optional title")}
+                          className="w-full rounded-sm border border-ink/20 px-3 py-1.5 text-sm bg-white"
+                          autoFocus={i === 1}
+                        />
+                        <textarea
+                          value={memoDraft[cKey]}
+                          onChange={(e) => setMemoDraft(prev => ({ ...prev, [cKey]: e.target.value }))}
+                          placeholder={tr("输入便签内容...", "Enter memo content...")}
+                          className="w-full rounded-sm border border-ink/20 px-3 py-2 text-sm min-h-16 bg-white"
+                        />
+                      </div>
+                    );
+                  })}
                   <div className="flex justify-end pt-2">
                     <Button
                       onClick={() => {
-                        const m = memoDraft.trim();
+                        const settings: ModeOverride = {};
+                        for (const i of [1, 2, 3]) {
+                          const tKey = `title${i}` as keyof typeof memoDraft;
+                          const cKey = `text${i}` as keyof typeof memoDraft;
+                          settings[`memo_title_${i}`] = memoDraft[tKey].trim();
+                          settings[`memo_text_${i}`] = memoDraft[cKey].trim();
+                        }
                         commitModalAction(
                           paramModal.mode,
                           paramModal.action,
-                          m ? ({ memo_text: m } as ModeOverride) : undefined,
+                          settings,
                         );
                       }}
                       disabled={previewLoading}
@@ -3867,27 +4037,20 @@ function ConfigPageInner() {
                       <label className="block text-xs text-ink mb-1.5">
                         {tr("退休金领到？", "Life Expectancy")}
                       </label>
-                      <div className="flex gap-2">
-                        <button
-                          onClick={() => setLifeExpectancy(100)}
-                          className={`flex-1 px-3 py-2 rounded-sm text-sm transition-colors ${
-                            lifeExpectancy === 100
-                              ? "bg-ink text-white"
-                              : "bg-paper-dark text-ink hover:bg-ink/10"
-                          }`}
-                        >
-                          100 {tr("岁", "years")}
-                        </button>
-                        <button
-                          onClick={() => setLifeExpectancy(120)}
-                          className={`flex-1 px-3 py-2 rounded-sm text-sm transition-colors ${
-                            lifeExpectancy === 120
-                              ? "bg-ink text-white"
-                              : "bg-paper-dark text-ink hover:bg-ink/10"
-                          }`}
-                        >
-                          120 {tr("岁", "years")}
-                        </button>
+                      <div className="grid grid-cols-4 gap-2">
+                        {[80, 90, 100, 120].map((years) => (
+                          <button
+                            key={years}
+                            onClick={() => setLifeExpectancy(years)}
+                            className={`px-3 py-2 rounded-sm text-sm transition-colors ${
+                              lifeExpectancy === years
+                                ? "bg-ink text-white"
+                                : "bg-paper-dark text-ink hover:bg-ink/10"
+                            }`}
+                          >
+                            {years} {tr("岁", "years")}
+                          </button>
+                        ))}
                       </div>
                     </div>
                   </div>
@@ -3984,6 +4147,7 @@ function ConfigPageInner() {
                       onClick={() => {
                         commitModalAction(paramModal.mode, paramModal.action, {
                           style: timetableData.style,
+                          weekdays: timetableData.weekdays,
                           periods: timetableData.periods,
                           courses: timetableData.courses,
                         } as ModeOverride);
@@ -3992,6 +4156,73 @@ function ConfigPageInner() {
                       variant="outline"
                     >
                       {tr("预览课程表", "Preview Timetable")}
+                    </Button>
+                  </div>
+                </>
+              ) : paramModal.type === "vocab" ? (
+                <>
+                  <div className="text-xs text-ink-light mb-3">
+                    {tr(
+                      "选择词库并设置每日目标。保存后，下次进入背词模式会使用新的设置。",
+                      "Choose a deck and set the daily goal. The next vocab review session will use the saved settings.",
+                    )}
+                  </div>
+                  <div className="space-y-3">
+                    <div>
+                      <label className="block text-xs text-ink-light mb-1">{tr("词库", "Deck")}</label>
+                      <select
+                        value={vocabDeckId}
+                        onChange={(e) => setVocabDeckId(e.target.value)}
+                        className="w-full rounded-sm border border-ink/20 px-3 py-2 text-sm bg-white"
+                      >
+                        <option value="primary_en">{tr("小学英语", "Primary English")}</option>
+                        <option value="middle_school_en">{tr("初中英语", "Middle School English")}</option>
+                        <option value="high_school_en">{tr("高中英语", "High School English")}</option>
+                        <option value="cet4_en">{tr("四级词汇", "CET-4")}</option>
+                        <option value="cet6_en">{tr("六级词汇", "CET-6")}</option>
+                        <option value="ielts_en">{tr("雅思词汇", "IELTS")}</option>
+                        <option value="toefl_en">{tr("托福词汇", "TOEFL")}</option>
+                        <option value="core_en">{tr("核心英语", "Core English")}</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-xs text-ink-light mb-1">{tr("每日目标", "Daily Goal")}</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={200}
+                        value={vocabDailyLimit}
+                        onChange={(e) => setVocabDailyLimit(Math.max(1, Math.min(200, Number(e.target.value) || 30)))}
+                        className="w-full rounded-sm border border-ink/20 px-3 py-2 text-sm bg-white"
+                      />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 pt-3">
+                    <Button
+                      onClick={() =>
+                        saveVocabReviewSettings(paramModal.mode, {
+                          deck_id: "core_en",
+                          daily_limit: 30,
+                          new_cards_per_day: 30,
+                        } as ModeOverride)
+                      }
+                      disabled={saving}
+                      variant="outline"
+                    >
+                      {tr("保存默认", "Save Default")}
+                    </Button>
+                    <Button
+                      onClick={() =>
+                        saveVocabReviewSettings(paramModal.mode, {
+                          deck_id: vocabDeckId,
+                          daily_limit: vocabDailyLimit,
+                          new_cards_per_day: vocabDailyLimit,
+                        } as ModeOverride)
+                      }
+                      disabled={saving}
+                      variant="outline"
+                    >
+                      {saving ? tr("保存中...", "Saving...") : tr("保存设置", "Save Settings")}
                     </Button>
                   </div>
                 </>

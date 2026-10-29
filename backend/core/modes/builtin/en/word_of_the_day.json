@@ -94,15 +94,31 @@
         "gap": 4,
         "word_inset_x": 8,
         "word_font_size": 22,
-        "phonetic_font_size": 8,
+        "phonetic_font_name": "GentiumPlus-Regular.ttf",
+        "phonetic_font_size": 16,
         "separator_width": 30,
         "definition_font_size": 10,
         "definition_max_lines": 1,
-        "example_field": null
+        "example_field": null,
+        "justify": "start",
+        "padding_top": 4,
+        "padding_bottom": 12
       },
       "footer": {
         "label": "Word of the Day",
         "height": 18
+      }
+    },
+    "648x480": {
+      "preset_props": {
+        "padding_x": 24,
+        "gap": 11,
+        "word_inset_x": 36,
+        "word_font_size": 64,
+        "phonetic_font_size": 15,
+        "separator_width": 44,
+        "definition_font_size": 20,
+        "example_font_size": 15
       }
     },
     "800x480": {

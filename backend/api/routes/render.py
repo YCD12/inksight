@@ -24,6 +24,7 @@ from api.shared import (
     resolve_preview_voltage,
     resolve_refresh_minutes_for_device_state,
 )
+from core.activity_store import log_user_activity
 from core.auth import require_device_token, validate_mac_param
 from core.config import DEFAULT_REFRESH_INTERVAL, SCREEN_HEIGHT, SCREEN_WIDTH
 from core.config_store import (
@@ -218,6 +219,7 @@ async def render(
         headers: dict[str, str] = {
             "X-Render-Time-Ms": str(elapsed_ms),
             "X-Cache-Hit": "1" if cache_hit else "0",
+            "X-Mode-Id": resolved_persona,
         }
         if configured_refresh_minutes is not None:
             headers["X-Refresh-Minutes"] = str(configured_refresh_minutes)
@@ -299,6 +301,12 @@ async def preview(
     city_override: Optional[str] = Query(default=None),
     mode_override: Optional[str] = Query(default=None),
     memo_text: Optional[str] = Query(default=None),
+    memo_title_1: Optional[str] = Query(default=None),
+    memo_text_1: Optional[str] = Query(default=None),
+    memo_title_2: Optional[str] = Query(default=None),
+    memo_text_2: Optional[str] = Query(default=None),
+    memo_title_3: Optional[str] = Query(default=None),
+    memo_text_3: Optional[str] = Query(default=None),
     w: int = Query(default=SCREEN_WIDTH, ge=100, le=1600),
     h: int = Query(default=SCREEN_HEIGHT, ge=100, le=1200),
     no_cache: Optional[int] = Query(default=None),
@@ -349,6 +357,11 @@ async def preview(
             preview_city_override=(city_override.strip() if city_override else None),
             preview_mode_override=parsed_mode_override,
             preview_memo_text=(memo_text if isinstance(memo_text, str) else None),
+            preview_memo_settings={k: v for k, v in {
+                "memo_title_1": memo_title_1, "memo_text_1": memo_text_1,
+                "memo_title_2": memo_title_2, "memo_text_2": memo_text_2,
+                "memo_title_3": memo_title_3, "memo_text_3": memo_text_3,
+            }.items() if v is not None} or None,
             preview_ui_language=_preview_ui_lang,
             current_user_id=current_user_id,
             user_api_key=x_inksight_llm_api_key,
@@ -357,6 +370,13 @@ async def preview(
         )
         if intent == 1:
             from fastapi.responses import JSONResponse
+            if current_user_id:
+                await log_user_activity(
+                    current_user_id,
+                    "preview.intent",
+                    request=request,
+                    metadata={"mac": mac or "", "persona": resolved_persona, "cache_hit": bool(cache_hit)},
+                )
 
             return JSONResponse(
                 status_code=200,
@@ -399,6 +419,13 @@ async def preview(
             )
         png_bytes = image_to_png_bytes(img)
         logger.info("[PREVIEW] Generated PNG persona=%s size=%sx%s", resolved_persona, w, h)
+        if current_user_id:
+            await log_user_activity(
+                current_user_id,
+                "preview.render",
+                request=request,
+                metadata={"mac": mac or "", "persona": resolved_persona, "cache_hit": bool(cache_hit), "size": f"{w}x{h}"},
+            )
         
         # 确定生成状态（使用英文避免编码问题）
         status_msg = "no_llm_required" if not llm_mode_requires_quota else ("model_generated" if not _content_fallback else "fallback_used")
@@ -433,6 +460,12 @@ async def preview_stream(
     city_override: Optional[str] = Query(default=None),
     mode_override: Optional[str] = Query(default=None),
     memo_text: Optional[str] = Query(default=None),
+    memo_title_1: Optional[str] = Query(default=None),
+    memo_text_1: Optional[str] = Query(default=None),
+    memo_title_2: Optional[str] = Query(default=None),
+    memo_text_2: Optional[str] = Query(default=None),
+    memo_title_3: Optional[str] = Query(default=None),
+    memo_text_3: Optional[str] = Query(default=None),
     w: int = Query(default=SCREEN_WIDTH, ge=100, le=1600),
     h: int = Query(default=SCREEN_HEIGHT, ge=100, le=1200),
     no_cache: Optional[int] = Query(default=None),
@@ -483,6 +516,11 @@ async def preview_stream(
                 preview_city_override=(city_override.strip() if city_override else None),
                 preview_mode_override=parsed_mode_override,
                 preview_memo_text=(memo_text if isinstance(memo_text, str) else None),
+                preview_memo_settings={k: v for k, v in {
+                    "memo_title_1": memo_title_1, "memo_text_1": memo_text_1,
+                    "memo_title_2": memo_title_2, "memo_text_2": memo_text_2,
+                    "memo_title_3": memo_title_3, "memo_text_3": memo_text_3,
+                }.items() if v is not None} or None,
                 preview_ui_language=_preview_ui_lang,
                 current_user_id=current_user_id,
                 user_api_key=x_inksight_llm_api_key,

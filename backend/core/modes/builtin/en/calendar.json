@@ -75,5 +75,48 @@
       { "type": "text", "field": "text", "font_size": 13, "align": "center", "max_lines": 1 }
     ],
     "footer": { "label": "CALENDAR", "attribution_template": "— InkSight" }
+  },
+  "layout_overrides": {
+    "296x128": {
+      "body": [
+        {
+          "type": "calendar_grid",
+          "font_size": 16,
+          "header_font_size": 11,
+          "sub_font_size": 7,
+          "reminder_font": "noto_serif_light",
+          "reminder_font_size": 9,
+          "header_gap": 5,
+          "date_line_gap": 2,
+          "margin_x": 10,
+          "cell_height": 34,
+          "max_rows": 2
+        },
+        { "type": "spacer", "height": 16 },
+        { "type": "separator", "style": "dashed", "margin_x": 5 },
+        { "type": "text", "field": "text", "font_size": 13, "align": "center", "max_lines": 1 }
+      ],
+      "footer": { "label": "CALENDAR", "height": 20 }
+    },
+    "648x480": {
+      "body": [
+        {
+          "type": "calendar_grid",
+          "font_size": 19,
+          "header_font_size": 12,
+          "sub_font_size": 8,
+          "reminder_font": "noto_serif_light",
+          "reminder_font_size": 9,
+          "header_gap": 6,
+          "date_line_gap": 2,
+          "margin_x": 18,
+          "cell_height": 39,
+          "today_padding": 2
+        },
+        { "type": "spacer", "height": 12 },
+        { "type": "separator", "style": "dashed", "margin_x": 16 },
+        { "type": "text", "field": "text", "font_size": 12, "align": "center", "max_lines": 1 }
+      ]
+    }
   }
 }

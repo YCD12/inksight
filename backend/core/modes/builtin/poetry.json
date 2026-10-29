@@ -6,7 +6,7 @@
   "description": "与季节天气相关的中国古诗词",
   "content": {
     "type": "llm_json",
-    "prompt_template": "你是一位古典文学专家。根据以下环境信息，推荐一首与当前季节、天气或节日相关的中国古诗词。\n用 JSON 格式输出：{{\"title\": \"诗名\", \"author\": \"朝代·作者\", \"lines\": [\"诗句1\", \"诗句2\", ...], \"note\": \"一句话赏析（20字以内）\"}}\n要求：\n1. 选择经典诗词，涵盖唐诗、宋词、元曲等\n2. 每次推荐不同的诗词，避免重复\n3. 诗句完整呈现，每句单独一个元素\n4. 只输出 JSON，不要其他内容\n环境：{context}",
+    "prompt_template": "你是一位古典文学专家。根据以下环境信息，推荐一首与当前季节、天气或节日相关的中国古诗词。\n用 JSON 格式输出：{{\"title\": \"诗名\", \"author\": \"朝代·作者\", \"lines\": [\"诗句1\", \"诗句2\", ...], \"note\": \"一句话赏析（20字以内）\"}}\n要求：\n1. 选择经典诗词，涵盖唐诗、宋词、元曲等\n2. 每次推荐不同的诗词，避免重复\n3. 诗句完整呈现，每句单独一个数组元素；每句字数不拘，可为五言、七言、长短句等\n4. 只输出 JSON，不要其他内容\n环境：{context}",
     "output_schema": {
       "title": {
         "type": "string",
@@ -126,14 +126,19 @@
     "296x128": {
       "preset_props": {
         "top_gap": 0,
-        "gap": 5,
+        "justify": "start",
+        "content_bias_px": 10,
+        "gap": 4,
         "title_font_size": 11,
         "author_field": null,
         "separator_width": 40,
-        "lines_limit": 4,
-        "lines_inset_x": 8,
-        "lines_font_size": 11,
+        "lines_limit": 8,
+        "lines_inset_x": 4,
+        "lines_font_size": 10,
         "lines_gap": 3,
+        "line_max_lines": 2,
+        "lines_pair_step": 2,
+        "lines_pair_separator": "，",
         "note_field": null
       },
       "footer": {
@@ -141,6 +146,19 @@
         "attribution_template": "— {author}",
         "dashed": true,
         "height": 18
+      }
+    },
+    "648x480": {
+      "preset_props": {
+        "top_gap": 16,
+        "gap": 8,
+        "title_font_size": 18,
+        "author_font_size": 13,
+        "separator_width": 72,
+        "lines_inset_x": 32,
+        "lines_font_size": 18,
+        "lines_gap": 8,
+        "note_font_size": 11
       }
     },
     "800x480": {

@@ -47,29 +47,58 @@ _font_warned: set[str] = set()
 _bitmap_warned: set[str] = set()
 _font_engine = os.getenv("INKSIGHT_FONT_ENGINE", "bitmap").strip().lower()
 _force_bitmap = _font_engine in {"bitmap", "pixel", "pil"}
-_fontmode = os.getenv("INKSIGHT_TEXT_FONTMODE", "1").strip()
+_fontmode = os.getenv("INKSIGHT_TEXT_FONTMODE", "1").strip() or "1"
 _bitmap_suffix_to_load_size = {9: 12, 10: 13, 11: 15, 12: 16, 13: 14}
-_bitmap_max_request_size = int(os.getenv("INKSIGHT_BITMAP_MAX_REQUEST_SIZE", "16"))
+# After component-tree scale (~1.35 on 648px+ wide screens), body/title pt often lands in
+# the high teens or low twenties; default 16 blocked PCF and forced anti-aliased TTF on e-ink.
+_bitmap_max_request_size = int(os.getenv("INKSIGHT_BITMAP_MAX_REQUEST_SIZE", "24"))
+_bitmap_max_size_delta = int(os.getenv("INKSIGHT_BITMAP_MAX_SIZE_DELTA", "8"))
 
 
 def apply_text_fontmode(draw: ImageDraw.ImageDraw) -> None:
+    """Configure Pillow text rasterization (`ImageDraw.Draw.fontmode`).
+
+    On mode ``1`` (binary) images, ``fontmode="L"`` anti-aliases into gray values that
+    threshold poorly on e-ink previews and look uniformly blurry across modes (BRIEFING,
+    DAILY, etc.). Mono ``"1"`` matches crisp PCF bitmaps and avoids mushy strokes.
+    """
+    im = getattr(draw, "_image", None) or getattr(draw, "im", None)
+    if im is not None and getattr(im, "mode", None) == "1":
+        draw.fontmode = "1"
+        return
     draw.fontmode = "1" if _fontmode != "L" else "L"
 
 
-def _ordered_bitmap_suffixes(size: int) -> list[int]:
+def _bitmap_load_size_for_suffix(suffix: int) -> int:
+    return _bitmap_suffix_to_load_size.get(suffix, suffix)
+
+
+def _available_bitmap_suffixes(font_name: str) -> list[int]:
+    name = os.path.basename(font_name)
+    stem, _ = os.path.splitext(name)
+    suffixes = set(_bitmap_suffix_to_load_size.keys())
+    try:
+        for rel in os.listdir(BITMAP_DIR):
+            m = re.fullmatch(rf"{re.escape(stem)}-(\d+)\.(pcf|otb|pil|ttf|otf)", rel, re.IGNORECASE)
+            if m:
+                suffixes.add(int(m.group(1)))
+    except OSError:
+        pass
+    return sorted(suffixes)
+
+
+def _ordered_bitmap_suffixes(font_name: str, size: int) -> list[int]:
     return sorted(
-        _bitmap_suffix_to_load_size.keys(),
-        key=lambda s: abs(_bitmap_suffix_to_load_size[s] - size),
+        _available_bitmap_suffixes(font_name),
+        key=lambda s: abs(_bitmap_load_size_for_suffix(s) - size),
     )
 
 
 def _bitmap_load_size_from_path(path: str, requested_size: int) -> int:
-    m = re.search(r"-(\d+)\.(pcf|otb)$", path.lower())
+    m = re.search(r"-(\d+)\.(pcf|otb|ttf|otf)$", path.lower())
     if m:
         suffix = int(m.group(1))
-        mapped = _bitmap_suffix_to_load_size.get(suffix)
-        if mapped is not None:
-            return mapped
+        return _bitmap_load_size_for_suffix(suffix)
     return requested_size
 
 
@@ -79,18 +108,61 @@ def _bitmap_candidates(font_name: str, size: int) -> list[str]:
     ext = ext.lower()
     if ext in {".pil", ".pcf", ".otb"}:
         return [name]
-    suffixes = _ordered_bitmap_suffixes(size)
+    suffixes = _ordered_bitmap_suffixes(font_name, size)
+    suffixes = [
+        s for s in suffixes
+        if abs(_bitmap_load_size_for_suffix(s) - size) <= _bitmap_max_size_delta
+    ]
     sized_pcf = [f"{stem}-{s}.pcf" for s in suffixes]
     sized_otb = [f"{stem}-{s}.otb" for s in suffixes]
     sized_pil = [f"{stem}-{s}.pil" for s in suffixes]
+    sized_ttf = [f"{stem}-{s}.ttf" for s in suffixes]
+    sized_otf = [f"{stem}-{s}.otf" for s in suffixes]
     return [
         *sized_pcf,
-        f"{stem}.pcf",
         *sized_otb,
-        f"{stem}.otb",
         *sized_pil,
+        *sized_ttf,
+        *sized_otf,
+        f"{stem}.pcf",
+        f"{stem}.otb",
         f"{stem}.pil",
+        f"{stem}.ttf",
+        f"{stem}.otf",
     ]
+
+
+def _bitmap_font_accepts_unicode_measurement(font: ImageFont.ImageFont) -> bool:
+    """Skip legacy PIL bitmap fonts that only support latin-1 (breaks CJK layout)."""
+    try:
+        font.getbbox("\u4e94")
+        return True
+    except (UnicodeEncodeError, TypeError, ValueError, OSError):
+        return False
+
+
+def safe_font_bbox(font: ImageFont.ImageFont, text: str) -> tuple[int, int, int, int]:
+    """Bounding box for wrapping/measurement; avoids latin-1-only PIL bitmap crashes on CJK."""
+    if not text:
+        return (0, 0, 0, 0)
+    try:
+        return font.getbbox(text)
+    except (UnicodeEncodeError, TypeError, ValueError, OSError):
+        pass
+    im = Image.new("L", (8, 8), 255)
+    draw = ImageDraw.Draw(im)
+    try:
+        return draw.textbbox((0, 0), text, font=font)
+    except (UnicodeEncodeError, TypeError, ValueError, OSError):
+        pass
+    try:
+        px = int(getattr(font, "size", 0) or 0)
+    except Exception:
+        px = 0
+    if px <= 0:
+        px = 16
+    w = max(1, len(text)) * max(6, int(px * 0.55))
+    return (0, -int(px * 0.8), int(w), int(px * 0.25))
 
 
 def _load_bitmap_font(font_name: str, size: int) -> ImageFont.ImageFont | None:
@@ -103,10 +175,14 @@ def _load_bitmap_font(font_name: str, size: int) -> ImageFont.ImageFont | None:
         try:
             lower = path.lower()
             if lower.endswith(".pil"):
-                return ImageFont.load(path)
-            load_size = _bitmap_load_size_from_path(path, size)
-            return ImageFont.truetype(path, load_size)
-        except OSError:
+                ft = ImageFont.load(path)
+            else:
+                load_size = _bitmap_load_size_from_path(path, size)
+                ft = ImageFont.truetype(path, load_size)
+            if not _bitmap_font_accepts_unicode_measurement(ft):
+                continue
+            return ft
+        except Exception:
             if rel not in _bitmap_warned:
                 _bitmap_warned.add(rel)
                 logger.warning(f"[FONT] Failed to load bitmap font: {path}", exc_info=True)
@@ -159,7 +235,14 @@ def load_font_by_name(name: str, size: int, force_truetype: bool = False) -> Ima
     if os.path.exists(path):
         if name.lower().endswith(".pil"):
             return ImageFont.load(path)
-        return ImageFont.truetype(path, size)
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception as e:
+            logger.warning(f"[FONT] Failed to load {name}: {e}")
+            fallback_cjk = "NotoSerifSC-Regular.ttf"
+            fallback_path = os.path.join(TRUETYPE_DIR, fallback_cjk)
+            if os.path.exists(fallback_path):
+                return ImageFont.truetype(fallback_path, size)
     if name not in _font_warned:
         _font_warned.add(name)
         logger.warning(f"[FONT] Missing {name}, run: python scripts/setup_fonts.py")
@@ -258,6 +341,7 @@ def draw_status_bar(
     screen_h: int = SCREEN_HEIGHT,
     colors: int = 2,
     language: str = "zh",
+    separator_y: int | None = None,
 ):
     """绘制顶部状态栏"""
     is_en = language == "en"
@@ -352,7 +436,10 @@ def draw_status_bar(
 
     draw.text((bx + batt_box_w + int(6 * scale), y), batt_text, fill=batt_fill, font=font_en)
 
-    line_y = int(screen_h * 0.11)
+    if separator_y is not None:
+        line_y = max(0, min(int(separator_y), max(0, screen_h - 1)))
+    else:
+        line_y = int(screen_h * 0.11)
     if dashed:
         draw_dashed_line(draw, (0, line_y), (screen_w, line_y), fill=EINK_FG, width=line_width)
     else:
@@ -378,15 +465,23 @@ def draw_footer(
     screen_w: int = SCREEN_WIDTH,
     screen_h: int = SCREEN_HEIGHT,
     colors: int = 2,
+    footer_top: int | None = None,
 ):
-    """绘制底部页脚"""
+    """绘制底部页脚。
+
+    ``footer_top`` 由 JSON 渲染器传入时表示正文与页脚分界线（与预留的 footer 高度一致）。
+    在 296×128 等小高度屏上必须用该值对齐，否则会按百分比把文字画到屏幕外而被裁切。
+    """
     scale = screen_w / 400.0
     if attr_font_size is None:
         attr_font_size = int(FONT_SIZES["footer"]["attribution"] * scale)
 
-    # Smaller footer on short screens
-    footer_pct = 0.08 if screen_h < 200 else 0.10
-    y_line = screen_h - int(screen_h * footer_pct)
+    if footer_top is not None:
+        y_line = max(0, min(int(footer_top), max(0, screen_h - 2)))
+    else:
+        footer_pct = 0.08 if screen_h < 200 else 0.10
+        y_line = screen_h - int(screen_h * footer_pct)
+
     if dashed:
         draw_dashed_line(
             draw, (0, y_line), (screen_w, y_line), fill=EINK_FG, width=line_width
@@ -394,7 +489,8 @@ def draw_footer(
     else:
         draw.line([(0, y_line), (screen_w, y_line)], fill=EINK_FG, width=line_width)
 
-    font_label = load_font("inter_medium", int(FONT_SIZES["footer"]["label"] * scale))
+    label_pt = max(6, int(FONT_SIZES["footer"]["label"] * scale))
+    font_label = load_font("inter_medium", label_pt)
     if attr_font:
         font_attr = load_font_by_name(attr_font, attr_font_size)
     elif attribution and has_cjk(attribution):
@@ -403,7 +499,6 @@ def draw_footer(
         font_attr = load_font("lora_regular", attr_font_size)
 
     icon_x = int(12 * scale)
-    icon_y = y_line + int(9 * scale)
     icon_key = str(mode_id or mode)
     mode_icon = None
     if icon_key.upper() == "WEATHER" and weather_code is not None:
@@ -413,18 +508,60 @@ def draw_footer(
             mode_icon = None
     if mode_icon is None:
         mode_icon = get_mode_icon(icon_key)
+    icon_h = mode_icon.height if mode_icon else 0
+
+    lb = font_label.getbbox("Mg")
+    lab_h = max(1, lb[3] - lb[1])
+    ab = font_attr.getbbox("Mg")
+    aab_h = max(1, ab[3] - ab[1])
+    text_h = max(lab_h, aab_h)
+    row_h = max(text_h, icon_h)
+
+    inner_top = y_line + line_width
+    band_h = max(0, screen_h - inner_top)
+
+    if band_h >= row_h:
+        text_y = inner_top + (band_h - row_h) // 2
+    else:
+        text_y = inner_top
+    max_bottom = screen_h - 3  # 底边留白，避开胶框遮挡感
+    label_upper = mode.upper()
+    attrib_pad_r = int(12 * scale)
+    attrib_anchor_x = screen_w - attrib_pad_r
+
+    label_x_base = icon_x + (int(15 * scale) if mode_icon else 0)
+
+    def _clamp_text_y(ty: int) -> int:
+        lbl_bb = draw.textbbox((label_x_base, ty), label_upper, font=font_label)
+        bottom = lbl_bb[3]
+        if attribution:
+            ab0 = draw.textbbox((0, 0), attribution, font=font_attr)
+            att_w = ab0[2] - ab0[0]
+            ax = attrib_anchor_x - att_w
+            att_bb = draw.textbbox((ax, ty), attribution, font=font_attr)
+            bottom = max(bottom, att_bb[3])
+        if bottom <= max_bottom:
+            return ty
+        shift = bottom - max_bottom
+        return max(inner_top, ty - shift)
+
+    text_y = _clamp_text_y(text_y)
+
     if mode_icon:
         icon_fill = EINK_COLOR_NAME_MAP.get("red", EINK_FG) if colors >= 3 else EINK_FG
+        icon_y = text_y + max(0, (row_h - icon_h) // 2)
         paste_icon_onto(img, mode_icon, (icon_x, icon_y), fill=icon_fill)
         label_x = icon_x + int(15 * scale)
     else:
         label_x = icon_x
-    draw.text((label_x, y_line + int(9 * scale)), mode.upper(), fill=EINK_FG, font=font_label)
+
+    draw.text((label_x, text_y), label_upper, fill=EINK_FG, font=font_label)
 
     if attribution:
         bbox = draw.textbbox((0, 0), attribution, font=font_attr)
+        att_w = bbox[2] - bbox[0]
         draw.text(
-            (screen_w - int(12 * scale) - (bbox[2] - bbox[0]), y_line + int(9 * scale)),
+            (attrib_anchor_x - att_w, text_y),
             attribution,
             fill=EINK_FG,
             font=font_attr,
@@ -439,8 +576,9 @@ def wrap_text(text: str, font: ImageFont.ImageFont, max_width: int) -> list[str]
         current = ""
         for ch in words:
             test = current + ch
-            bbox = font.getbbox(test)
-            if bbox[2] > max_width:
+            bbox = safe_font_bbox(font, test)
+            span = bbox[2] - bbox[0]
+            if span > max_width:
                 if current:
                     lines.append(current)
                 current = ch
@@ -449,6 +587,43 @@ def wrap_text(text: str, font: ImageFont.ImageFont, max_width: int) -> list[str]
         if current:
             lines.append(current)
     return lines
+
+
+def wrap_text_fill_sidebar(
+    text: str,
+    font: ImageFont.ImageFont,
+    sidebar_width: int,
+    sidebar_max_height: int,
+    line_height: int,
+) -> tuple[list[str], str]:
+    """Fill a narrow column beside a float up to sidebar_max_height; return (lines, remaining text).
+
+    Used for e-ink \"text wraps around a left block\" layouts. Each line is the first line of
+    ``wrap_text`` on the remaining string; ``line_height`` must match the renderer's line step.
+    """
+    lines_out: list[str] = []
+    if not text or not text.strip():
+        return lines_out, ""
+    if sidebar_width <= 0 or sidebar_max_height <= 0 or line_height <= 0:
+        return lines_out, text.strip()
+    rest = text.strip()
+    guard = 0
+    limit = max(3, len(text) + 2)
+    while rest and guard < limit:
+        guard += 1
+        if len(lines_out) * line_height + line_height > sidebar_max_height:
+            break
+        chunk = wrap_text(rest, font, max(1, sidebar_width))
+        if not chunk or not chunk[0]:
+            break
+        line = chunk[0]
+        lines_out.append(line)
+        trimmed = rest.lstrip()
+        if trimmed.startswith(line):
+            rest = trimmed[len(line) :].lstrip()
+        else:
+            break
+    return lines_out, rest.strip()
 
 
 def render_quote_body(
@@ -469,6 +644,6 @@ def render_quote_body(
     y_start = 32 + (screen_h - 32 - 30 - total_h) // 2
 
     for i, line in enumerate(lines):
-        bbox = font.getbbox(line)
+        bbox = safe_font_bbox(font, line)
         x = (screen_w - (bbox[2] - bbox[0])) // 2
         draw.text((x, y_start + i * line_h), line, fill=EINK_FG, font=font)

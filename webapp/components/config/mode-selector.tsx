@@ -4,6 +4,7 @@ import { useState } from "react";
 import { ChevronDown, Eye, LayoutGrid, Plus, Trash2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ColorSelect } from "@/components/ui/color-select";
+import { ScreenSizeSelect } from "@/components/ui/screen-size-select";
 
 type ModeMeta = Record<string, { name: string; tip: string }>;
 
@@ -21,6 +22,9 @@ type ModeSelectorProps = {
   onCreateCustomMode: () => void;
   previewColors?: number;
   onColorsChange?: (v: number) => void;
+  previewWidth?: number;
+  previewHeight?: number;
+  onScreenSizeChange?: (w: number, h: number) => void;
 };
 
 export function ModeSelector({
@@ -37,6 +41,9 @@ export function ModeSelector({
   onCreateCustomMode,
   previewColors,
   onColorsChange,
+  previewWidth = 400,
+  previewHeight = 300,
+  onScreenSizeChange,
 }: ModeSelectorProps) {
   return (
     <Card>
@@ -47,6 +54,9 @@ export function ModeSelector({
           </CardTitle>
           {onColorsChange && previewColors !== undefined && (
             <ColorSelect value={previewColors} onChange={onColorsChange} tr={tr} />
+          )}
+          {onScreenSizeChange && previewWidth !== undefined && previewHeight !== undefined && (
+            <ScreenSizeSelect width={previewWidth} height={previewHeight} onChange={onScreenSizeChange} tr={tr} />
           )}
         </div>
       </CardHeader>

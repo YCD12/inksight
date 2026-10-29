@@ -6,7 +6,7 @@
   "description": "Seasonal breakfast, lunch, and dinner suggestions",
   "content": {
     "type": "llm_json",
-    "prompt_template": "You are a nutritionist. Recommend a simple breakfast, lunch, and dinner plan for today based on the season.\nOutput JSON: {{\"season\": \"Season (e.g. Early Spring)\", \"breakfast\": \"Breakfast (under 30 chars, use · to separate items)\", \"lunch\": \"Lunch (under 30 chars)\", \"dinner\": \"Dinner (under 30 chars)\", \"tip\": \"Nutrition tip (under 30 chars)\"}}\nKeep it simple and clear. Output JSON only.\nContext: {context}",
+    "prompt_template": "You are a nutritionist. Recommend a simple breakfast, lunch, and dinner plan for today based on the season.\nOutput JSON: {{\"season\": \"Season (e.g. Early Spring)\", \"breakfast\": \"Breakfast (under 30 chars)\", \"lunch\": \"Lunch (under 30 chars)\", \"dinner\": \"Dinner (under 30 chars)\", \"tip\": \"Nutrition tip (under 30 chars)\"}}\nIf a meal lists multiple dishes, separate them with a middle dot with one space on each side: \" · \" (example: Oatmeal · Berries · Green tea). Do not omit those spaces. Output JSON only.\nContext: {context}",
     "output_schema": {
       "season": {
         "type": "string",
@@ -28,6 +28,11 @@
         "type": "string",
         "default": "Eat the rainbow for balanced nutrition."
       }
+    },
+    "post_process": {
+      "breakfast": "recipe_normalize_item_sep",
+      "lunch": "recipe_normalize_item_sep",
+      "dinner": "recipe_normalize_item_sep"
     },
     "temperature": 0.8,
     "fallback": {
@@ -99,6 +104,7 @@
         "padding_x": 8,
         "gap": 4,
         "season_font_size": 12,
+        "show_season_separator": false,
         "separator_width": 30,
         "compact_delimiter": ": ",
         "compact_font": "noto_serif_regular",

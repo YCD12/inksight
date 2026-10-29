@@ -12,6 +12,7 @@ import { localeFromPathname, t, withLocalePath } from "@/lib/i18n";
 import { cleanLocationValue, type LocationValue } from "@/lib/locations";
 import { authHeaders, fetchCurrentUser } from "@/lib/auth";
 import { ColorSelect } from "@/components/ui/color-select";
+import { ScreenSizeSelect } from "@/components/ui/screen-size-select";
 import { CalendarReminders } from "@/components/config/calendar-reminders";
 import { TimetableEditor, type TimetableData } from "@/components/config/timetable-editor";
 
@@ -113,13 +114,15 @@ export default function ExperiencePage() {
   // do not preselect any mode
   const [previewMode, setPreviewMode] = useState("");
   const [previewColors, setPreviewColors] = useState(2);
+  const [previewWidth, setPreviewWidth] = useState(400);
+  const [previewHeight, setPreviewHeight] = useState(300);
   const [previewModeNameOverride, setPreviewModeNameOverride] = useState<string | null>(null);
 
   const [city] = useState("杭州");
   const [memoText] = useState(t(locale, "preview.memo.default", "写点什么吧…"));
+  const defaultMemoDraft = { title1: "", text1: "", title2: "", text2: "", title3: "", text3: "" };
 
   const [previewLoading, setPreviewLoading] = useState(false);
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [toast, setToast] = useState<{ msg: string; type: "success" | "error" | "info" } | null>(null);
 
@@ -131,12 +134,11 @@ export default function ExperiencePage() {
   const toastTimerRef = useRef<number | null>(null);
 
   const [modal, setModal] = useState<null | { type: "quote" | "weather" | "memo" | "countdown" | "habit" | "lifebar" | "calendar" | "timetable"; modeId: string }>(null);
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [_imageUploadLoading, setImageUploadLoading] = useState(false);
   const [quoteDraft, setQuoteDraft] = useState("");
   const [authorDraft, setAuthorDraft] = useState("");
   const [weatherDraftLocation, setWeatherDraftLocation] = useState<LocationValue>({ city: "杭州" });
-  const [memoDraft, setMemoDraft] = useState("");
+  const [memoDraft, setMemoDraft] = useState<{ title1: string; text1: string; title2: string; text2: string; title3: string; text3: string }>({ title1: "", text1: "", title2: "", text2: "", title3: "" , text3: "" });
   const [calendarReminders, setCalendarReminders] = useState<Record<string, string>>({});
   const [timetableData, setTimetableData] = useState<TimetableData>({
     style: "weekly",
@@ -163,7 +165,7 @@ export default function ExperiencePage() {
   
   // 人生进度条状态
   const [userAge, setUserAge] = useState(30);
-  const [lifeExpectancy, setLifeExpectancy] = useState<100 | 120>(100);
+  const [lifeExpectancy, setLifeExpectancy] = useState(80);
   
   const [showCustomModeModal, setShowCustomModeModal] = useState(false);
   const [customDesc, setCustomDesc] = useState("");
@@ -262,7 +264,6 @@ export default function ExperiencePage() {
     modeMeta[previewMode]?.name ||
     previewMode ||
     t(locale, "preview.unknown_mode", "Unknown");
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const previewModeTip =
     modeMeta[previewMode]?.tip ||
     "";
@@ -281,7 +282,7 @@ export default function ExperiencePage() {
       }
       if (targetMode === "MEMO") {
         setModal({ type: "memo", modeId: targetMode });
-        setMemoDraft(memoText);
+        setMemoDraft(defaultMemoDraft);
         return;
       }
       if (targetMode === "MY_QUOTE") {
@@ -320,19 +321,23 @@ export default function ExperiencePage() {
       params.set("persona", targetMode);
       params.set("ui_language", locale === "en" ? "en" : "zh");
       if (previewColors > 2) params.set("colors", String(previewColors));
-      
+      params.set("w", String(previewWidth));
+      params.set("h", String(previewHeight));
+
       // 处理城市覆盖：优先使用 override 中的 city，否则使用全局 city
       const cityOverride = override?.city ? String(override.city) : city.trim();
       if (cityOverride) {
         params.set("city_override", cityOverride);
       }
       
-      // 处理便签文本：优先使用 override 中的 memo_text
-      if (targetMode === "MEMO") {
-        const memoOverrideValue =
-          override && "memo_text" in override ? override.memo_text : undefined;
-        const memoOverride = memoOverrideValue ? String(memoOverrideValue) : memoText;
-        params.set("memo_text", memoOverride);
+      // 处理便签文本：优先使用 override 中的 memo_title/text 字段
+      if (targetMode === "MEMO" && override) {
+        for (const i of [1, 2, 3]) {
+          const tk = `memo_title_${i}`;
+          const ck = `memo_text_${i}`;
+          if (tk in override) params.set(tk, String((override as Record<string, unknown>)[tk]));
+          if (ck in override) params.set(ck, String((override as Record<string, unknown>)[ck]));
+        }
       }
       
       const mergedOverride: Record<string, unknown> = { ...(override || {}) };
@@ -341,6 +346,7 @@ export default function ExperiencePage() {
       }
       if (targetMode.toUpperCase() === "TIMETABLE" && !override) {
         mergedOverride.style = timetableData.style;
+        mergedOverride.weekdays = timetableData.weekdays;
         mergedOverride.periods = timetableData.periods;
         mergedOverride.courses = timetableData.courses;
       }
@@ -469,7 +475,7 @@ export default function ExperiencePage() {
     }
     if (modeId === "MEMO") {
       setPreviewMode(modeId);
-      setMemoDraft(memoText);
+      setMemoDraft(defaultMemoDraft);
       setModal({ type: "memo", modeId });
       return;
     }
@@ -509,7 +515,7 @@ export default function ExperiencePage() {
       const res = await fetch("/api/modes/custom/preview", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode_def: def, colors: previewColors }),
+        body: JSON.stringify({ mode_def: def, colors: previewColors, w: previewWidth, h: previewHeight }),
       });
       if (!res.ok) {
         const d = await res.json().catch(() => ({}));
@@ -675,6 +681,7 @@ export default function ExperiencePage() {
                 <div className="flex items-center gap-3">
                   <CardTitle>{t(locale, "preview.panel.modes", "Modes")}</CardTitle>
                   <ColorSelect value={previewColors} onChange={setPreviewColors} tr={(zh, en) => locale === "zh" ? zh : en} />
+                  <ScreenSizeSelect width={previewWidth} height={previewHeight} onChange={(w, h) => { setPreviewWidth(w); setPreviewHeight(h); }} tr={(zh, en) => locale === "zh" ? zh : en} />
                 </div>
                 <button
                   onClick={() => {
@@ -756,7 +763,10 @@ export default function ExperiencePage() {
                   </div>
                 ) : previewImageUrl ? (
                   <div className="flex flex-col items-center gap-2 w-full">
-                    <div className="relative w-full max-w-md aspect-[4/3] bg-white border border-ink/20 rounded-sm overflow-hidden">
+                    <div
+                      className="relative w-full max-w-md bg-white border border-ink/20 rounded-sm overflow-hidden"
+                      style={{ aspectRatio: `${previewWidth}/${previewHeight}` }}
+                    >
                       <Image
                         src={previewImageUrl}
                         alt={t(locale, "preview.display.alt", "InkSight preview")}
@@ -931,28 +941,51 @@ export default function ExperiencePage() {
                 </>
               ) : modal.type === "memo" ? (
                 <>
-                  <div className="text-xs text-ink-light">
+                  <div className="text-xs text-ink-light mb-2">
                     {locale === "zh" 
-                      ? "输入便签内容，将在墨水屏上显示。" 
-                      : "Enter memo content to display on e-ink screen."}
+                      ? "设置便签标题和内容" 
+                      : "Set memo titles and content (up to 3 groups, empty groups are hidden)"}
                   </div>
-                  <textarea
-                    value={memoDraft}
-                    onChange={(e) => setMemoDraft(e.target.value)}
-                    placeholder={locale === "zh" ? "输入便签内容..." : "Enter memo content..."}
-                    className="w-full rounded-sm border border-ink/20 px-3 py-2 text-sm min-h-32 bg-white"
-                    autoFocus
-                  />
+                  {([1, 2, 3] as const).map((i) => {
+                    const tKey = `title${i}` as keyof typeof memoDraft;
+                    const cKey = `text${i}` as keyof typeof memoDraft;
+                    return (
+                      <div key={i} className="space-y-1">
+                        <label className="text-xs font-medium text-ink-light">
+                          {locale === "zh" ? `标题 ${i}` : `Title ${i}`}
+                          {i > 1 && <span className="text-ink-light/50 ml-1">({locale === "zh" ? "可选" : "optional"})</span>}
+                        </label>
+                        <input
+                          type="text"
+                          value={memoDraft[tKey]}
+                          onChange={(e) => setMemoDraft(prev => ({ ...prev, [tKey]: e.target.value }))}
+                          placeholder={i === 1 
+                            ? (locale === "zh" ? "输入标题，如：今日待办" : "e.g. Today's TODO") 
+                            : (locale === "zh" ? "可选标题" : "Optional title")}
+                          className="w-full rounded-sm border border-ink/20 px-3 py-1.5 text-sm bg-white"
+                          autoFocus={i === 1}
+                        />
+                        <textarea
+                          value={memoDraft[cKey]}
+                          onChange={(e) => setMemoDraft(prev => ({ ...prev, [cKey]: e.target.value }))}
+                          placeholder={locale === "zh" ? "输入便签内容..." : "Enter memo content..."}
+                          className="w-full rounded-sm border border-ink/20 px-3 py-2 text-sm min-h-16 bg-white"
+                        />
+                      </div>
+                    );
+                  })}
                   <div className="flex justify-end pt-2">
                     <Button
                       onClick={async () => {
-                        const m = memoDraft.trim();
                         setModal(null);
-                        if (m) {
-                          await handlePreview(modal.modeId, { memo_text: m });
-                        } else {
-                          await handlePreview(modal.modeId);
+                        const settings: Record<string, string> = {};
+                        for (const i of [1, 2, 3]) {
+                          const tKey = `title${i}` as keyof typeof memoDraft;
+                          const cKey = `text${i}` as keyof typeof memoDraft;
+                          settings[`memo_title_${i}`] = memoDraft[tKey].trim();
+                          settings[`memo_text_${i}`] = memoDraft[cKey].trim();
                         }
+                        await handlePreview(modal.modeId, settings);
                       }}
                       disabled={previewLoading}
                       variant="outline"
@@ -1126,27 +1159,20 @@ export default function ExperiencePage() {
                       <label className="block text-xs text-ink mb-1.5">
                         {locale === "zh" ? "退休金领到？" : "Life Expectancy"}
                       </label>
-                      <div className="flex gap-2">
-                        <button
-                          onClick={() => setLifeExpectancy(100)}
-                          className={`flex-1 px-3 py-2 rounded-sm text-sm transition-colors ${
-                            lifeExpectancy === 100
-                              ? "bg-ink text-white"
-                              : "bg-paper-dark text-ink hover:bg-ink/10"
-                          }`}
-                        >
-                          100 {locale === "zh" ? "岁" : "years"}
-                        </button>
-                        <button
-                          onClick={() => setLifeExpectancy(120)}
-                          className={`flex-1 px-3 py-2 rounded-sm text-sm transition-colors ${
-                            lifeExpectancy === 120
-                              ? "bg-ink text-white"
-                              : "bg-paper-dark text-ink hover:bg-ink/10"
-                          }`}
-                        >
-                          120 {locale === "zh" ? "岁" : "years"}
-                        </button>
+                      <div className="grid grid-cols-4 gap-2">
+                        {[80, 90, 100, 120].map((years) => (
+                          <button
+                            key={years}
+                            onClick={() => setLifeExpectancy(years)}
+                            className={`px-3 py-2 rounded-sm text-sm transition-colors ${
+                              lifeExpectancy === years
+                                ? "bg-ink text-white"
+                                : "bg-paper-dark text-ink hover:bg-ink/10"
+                            }`}
+                          >
+                            {years} {locale === "zh" ? "岁" : "years"}
+                          </button>
+                        ))}
                       </div>
                     </div>
                   </div>
@@ -1246,6 +1272,7 @@ export default function ExperiencePage() {
                         setModal(null);
                         await handlePreview(modal.modeId, {
                           style: timetableData.style,
+                          weekdays: timetableData.weekdays,
                           periods: timetableData.periods,
                           courses: timetableData.courses,
                         });

@@ -112,6 +112,66 @@ PROMPTS = {
 # ── Shared helpers ───────────────────────────────────────────
 
 
+def _sanitize_llm_json_substring_for_parse(s: str) -> str:
+    """Make LLM-produced JSON substring safe for json.loads.
+
+    - Raw CRLF/LF and Unicode LS/PS/NEL inside string values become \\n JSON escapes.
+    - Curly double quotes (Unicode) inside values become \\\" escapes so dialogue does
+      not prematurely close JSON strings (STORY twist/ending, LETTER, etc.).
+    """
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    in_string = False
+    escaped = False
+    while i < n:
+        ch = s[i]
+        if escaped:
+            out.append(ch)
+            escaped = False
+            i += 1
+            continue
+        if in_string:
+            if ch == "\\":
+                out.append(ch)
+                escaped = True
+            elif ch == '"':
+                out.append(ch)
+                in_string = False
+            elif ch == "\r":
+                out.append("\\n")
+                if i + 1 < n and s[i + 1] == "\n":
+                    i += 2
+                else:
+                    i += 1
+                continue
+            elif ch == "\n":
+                out.append("\\n")
+                i += 1
+                continue
+            elif ch in "\u2028\u2029":
+                out.append("\\n")
+                i += 1
+                continue
+            elif ch == "\u0085":
+                out.append("\\n")
+                i += 1
+                continue
+            elif ch in ("\u201c", "\u201d", "\uff02"):
+                out.append("\\")
+                out.append('"')
+                i += 1
+                continue
+            else:
+                out.append(ch)
+        else:
+            if ch == '"':
+                in_string = True
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _clean_json_response(text: str) -> str:
     """Remove markdown code fences and extract JSON from LLM responses."""
     cleaned = text.strip()
@@ -121,10 +181,22 @@ def _clean_json_response(text: str) -> str:
         if first_newline != -1:
             cleaned = cleaned[first_newline + 1:]
         cleaned = cleaned.rsplit("```", 1)[0]
+    # Do NOT globally replace curly quotes → " here: that breaks dialogue inside strings
+    # (see STORY twist/ending fields). Escaping happens in _sanitize_llm_json_substring_for_parse.
     # Try to extract a JSON object if surrounded by other text
     match = re.search(r'\{[\s\S]*\}', cleaned)
     if match:
         cleaned = match.group(0)
+    # Remove ASCII control chars that break JSON parsing (except \n \r \t)
+    cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', cleaned)
+    cleaned = _sanitize_llm_json_substring_for_parse(cleaned)
+    # Fix doubled braces from LLM echoing template syntax
+    while '{{' in cleaned or '}}' in cleaned:
+        cleaned = cleaned.replace('{{', '{').replace('}}', '}')
+    # Fix single-quoted JSON keys/values: replace ' with " when used as JSON delimiters
+    # Only if it looks like single-quoted JSON (starts with {')
+    if cleaned.startswith("{'") or cleaned.startswith("{ '"):
+        cleaned = re.sub(r"(?<=\{)\s*'|(?<=,)\s*'|'(?=\s*:)|(?<=:\s)'|'(?=\s*[,}])", '"', cleaned)
     return cleaned.strip()
 
 

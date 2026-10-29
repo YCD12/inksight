@@ -18,6 +18,7 @@ from core.json_content import (
     _parse_json_output,
     _parse_llm_json_output,
     _apply_post_process,
+    _prefetch_images,
     generate_json_mode_content,
 )
 
@@ -199,10 +200,50 @@ def test_apply_post_process_no_rules():
     assert result["text"] == "unchanged"
 
 
+def test_apply_post_process_recipe_normalize_item_sep_tight_dot():
+    cfg = {"post_process": {"breakfast": "recipe_normalize_item_sep"}}
+    result = _apply_post_process({"breakfast": "小米粥·茶叶蛋·凉拌黑木耳"}, cfg)
+    assert result["breakfast"] == "小米粥 · 茶叶蛋 · 凉拌黑木耳"
+
+
+def test_apply_post_process_recipe_normalize_item_sep_comma():
+    cfg = {"post_process": {"lunch": "recipe_normalize_item_sep"}}
+    result = _apply_post_process({"lunch": "番茄炖牛腩，清炒芥兰，白米饭"}, cfg)
+    assert result["lunch"] == "番茄炖牛腩 · 清炒芥兰 · 白米饭"
+
+
+def test_apply_post_process_recipe_normalize_item_sep_english_comma():
+    cfg = {"post_process": {"lunch": "recipe_normalize_item_sep"}}
+    result = _apply_post_process({"lunch": "Salad, Soup, Bread"}, cfg)
+    assert result["lunch"] == "Salad · Soup · Bread"
+
+
 def test_apply_post_process_skips_non_string():
     cfg = {"post_process": {"items": "first_char"}}
     result = _apply_post_process({"items": [1, 2, 3]}, cfg)
     assert result["items"] == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_prefetch_missing_uploaded_image_does_not_fetch_remote():
+    mode_def = {
+        "layout": {
+            "body": [
+                {"type": "image", "field": "image_url"},
+            ],
+        },
+    }
+    content = {
+        "image_url": "https://www.inksight.site/api/uploads/00000000-0000-4000-8000-000000000000",
+    }
+
+    with patch("core.json_content.httpx.AsyncClient") as mock_client:
+        client = mock_client.return_value.__aenter__.return_value
+        client.get = AsyncMock()
+        result = await _prefetch_images(dict(content), mode_def)
+
+    client.get.assert_not_awaited()
+    assert result["_invalid_image_url"] == "Image link expired"
 
 
 @pytest.mark.asyncio
@@ -585,4 +626,3 @@ async def test_almanac_api_uses_cache_db_across_calls(tmp_path):
             assert mock_tip.await_count == 1
     finally:
         await db_mod.close_all()
-

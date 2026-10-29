@@ -127,9 +127,75 @@
       "preset_props": {
         "padding_x": 8,
         "padding_y": 4,
-        "gap": 4
+        "justify": "start",
+        "gap": 8,
+        "random_subset_count": 2,
+        "sections": [
+          {
+            "title": "HN 热榜",
+            "icon": "global",
+            "kind": "repeat_row",
+            "field": "hn_items",
+            "limit": 1,
+            "gap": 4,
+            "left_field": "title",
+            "left_align": "left",
+            "left_max_lines": 1,
+            "left_grow": 1,
+            "right_field": "score",
+            "right_font": "noto_serif_regular",
+            "right_font_size": 10,
+            "right_align": "right",
+            "right_max_lines": 1
+          },
+          {
+            "title": "开发者社区",
+            "icon": "app",
+            "kind": "repeat_text",
+            "field": "devto_items",
+            "limit": 1,
+            "gap": 4,
+            "text_field": "title",
+            "text_align": "left",
+            "text_max_lines": 1,
+            "text_line_height": 14
+          },
+          {
+            "title": "产品跟踪",
+            "icon": "star",
+            "kind": "stack_text",
+            "gap": 2,
+            "items": [
+              { "field": "ph_name", "align": "left", "max_lines": 1 },
+              {
+                "field": "ph_tagline",
+                "align": "left",
+                "max_lines": 1,
+                "ellipsis": true,
+                "line_height": 14
+              }
+            ]
+          }
+        ]
       },
       "footer": { "label": "BRIEFING", "height": 18 }
+    },
+    "648x480": {
+      "component_theme": {
+        "body_font_size": 15,
+        "body_line_gap": 7,
+        "section_title_font_size": 16,
+        "section_icon_size": 16,
+        "section_icon_gap": 20,
+        "section_title_gap": 8,
+        "section_content_indent": 46,
+        "section_content_gap": 5
+      },
+      "preset_props": {
+        "padding_x": 24,
+        "padding_y": 8,
+        "gap": 12
+      }
     },
     "800x480": {
       "component_theme": {

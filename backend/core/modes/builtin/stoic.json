@@ -90,6 +90,14 @@
         "height": 18
       }
     },
+    "648x480": {
+      "preset_props": {
+        "padding_x": 20,
+        "quote_inset_x": 28,
+        "quote_font_size": 22,
+        "quote_max_lines": 4
+      }
+    },
     "800x480": {
       "preset_props": {
         "padding_x": 28,

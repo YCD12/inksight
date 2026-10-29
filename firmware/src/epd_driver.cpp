@@ -5,7 +5,7 @@
 
 #if defined(EPD_PANEL_42_SSD1683_BW) || defined(EPD_PANEL_42_DKE_RY683) || defined(EPD_PANEL_42_GDEM042F52)
 
-// ── Software SPI (bit-bang) for 4.2" SSD1683 BW panels ──
+// ── Software SPI (bit-bang) for 4.2" panels ──
 // Avoids Busy Timeout on ESP32-C3 with non-default pins; no GxEPD2 dependency.
 
 static void spiWriteByte(uint8_t data) {
@@ -109,7 +109,7 @@ void gpioInit() {
     digitalWrite(PIN_EPD_SCK, LOW);
 }
 
-// ── EPD full init (standard mode, 4.2" SSD1683 BW) ──
+// ── EPD full init (standard mode) ──
 
 void epdInit() {
 #if defined(EPD_PANEL_42_DKE_RY683)
@@ -413,6 +413,7 @@ static void epdSend2bppAndRefresh(const uint8_t *buf2bpp) {
 
 void epdDisplay(const uint8_t *image) {
 #if defined(EPD_PANEL_42_DKE_RY683) || defined(EPD_PANEL_42_GDEM042F52)
+    if (!ensureColorBuf()) { Serial.println("[EPD] colorBuf alloc failed"); return; }
     int rowBytes = W / 8;
     int out = 0;
     for (int y = 0; y < H; y++) {
@@ -452,10 +453,57 @@ void epdDisplay2bpp(const uint8_t *image2bpp) {
 #endif
 }
 
+// ── EPD deep clear (multi-cycle anti-ghosting) ──────────────
+// SSD1683 BW: cycles all-black/all-white via 0x24/0x26 registers.
+// 4-color panels: falls back to epdDisplay (no register-level deep clear).
+
+void epdDisplayDeepClear(const uint8_t *image) {
+#if defined(EPD_PANEL_42_DKE_RY683) || defined(EPD_PANEL_42_GDEM042F52)
+    epdDisplay(image);
+#else
+    epdInit();
+    int w = W / 8;
+    int total = w * H;
+
+    for (int pass = 0; pass < 4; pass++) {
+        uint8_t fill = (pass % 2 == 0) ? 0x00 : 0xFF;
+
+        epdSendCommand(0x24);
+        for (int i = 0; i < total; i++)
+            epdSendData(fill);
+
+        epdSendCommand(0x26);
+        for (int i = 0; i < total; i++)
+            epdSendData(fill);
+
+        epdSendCommand(0x22);
+        epdSendData(0xF7);
+        epdSendCommand(0x20);
+        epdWaitBusy();
+    }
+
+    epdSendCommand(0x24);
+    for (int j = 0; j < H; j++)
+        for (int i = 0; i < w; i++)
+            epdSendData(image[i + j * w]);
+
+    epdSendCommand(0x26);
+    for (int j = 0; j < H; j++)
+        for (int i = 0; i < w; i++)
+            epdSendData(image[i + j * w]);
+
+    epdSendCommand(0x22);
+    epdSendData(0xF7);
+    epdSendCommand(0x20);
+    epdWaitBusy();
+#endif
+}
+
 // ── EPD full-screen display (fast refresh, 0xC7) ────────────
 
 void epdDisplayFast(const uint8_t *image) {
 #if defined(EPD_PANEL_42_GDEM042F52)
+    if (!ensureColorBuf()) { Serial.println("[EPD] colorBuf alloc failed"); return; }
     int rowBytes = W / 8;
     int out = 0;
     for (int y = 0; y < H; y++) {
@@ -496,8 +544,21 @@ void epdDisplayFast(const uint8_t *image) {
 // ── EPD partial refresh ─────────────────────────────────────
 
 void epdPartialDisplay(uint8_t *data, int xStart, int yStart, int xEnd, int yEnd) {
+    epdPartialDisplayWithOld(data, nullptr, xStart, yStart, xEnd, yEnd);
+}
+
+bool epdSupportsPartialRefresh() {
+#if defined(EPD_PANEL_42_DKE_RY683) || defined(EPD_PANEL_42_GDEM042F52)
+    return false;
+#else
+    return true;
+#endif
+}
+
+void epdPartialDisplayWithOld(uint8_t *data, const uint8_t *oldData, int xStart, int yStart, int xEnd, int yEnd) {
 #if defined(EPD_PANEL_42_DKE_RY683) || defined(EPD_PANEL_42_GDEM042F52)
     (void)data;
+    (void)oldData;
     (void)xStart;
     (void)yStart;
     (void)xEnd;
@@ -540,6 +601,19 @@ void epdPartialDisplay(uint8_t *data, int xStart, int yStart, int xEnd, int yEnd
     for (int i = 0; i < count; i++)
         epdSendData(data[i]);
 
+    if (oldData) {
+        epdSendCommand(0x4E);  // Set RAM X address counter
+        epdSendData(xS & 0xFF);
+
+        epdSendCommand(0x4F);  // Set RAM Y address counter
+        epdSendData(yStart & 0xFF);
+        epdSendData((yStart >> 8) & 0xFF);
+
+        epdSendCommand(0x26);  // Write old/secondary RAM for stable partial inversion
+        for (int i = 0; i < count; i++)
+            epdSendData(oldData[i]);
+    }
+
     epdSendCommand(0x22);  // Display Update Control 2
     epdSendData(0xFF);     //   Partial update sequence
     epdSendCommand(0x20);  // Activate Display Update Sequence
@@ -561,6 +635,153 @@ void epdSleep() {
 #endif
 }
 
+#elif defined(EPD_PANEL_42_WFT)
+// ── WFT042 4.2" Panel (Waveshare-compatible, supports BW and tricolor via EPD_BPP) ──
+
+#include "epd_wft.h"
+
+// ── GPIO initialization ─────────────────────────────────────
+
+void gpioInit() {
+    pinMode(PIN_CFG_BTN, INPUT_PULLUP);
+    EPD_initSPI();
+}
+
+// ── EPD full init ──
+
+void epdInit() {
+#if EPD_BPP >= 2
+    EPD_dispIndex = 1; // tricolor mode
+#else
+    EPD_dispIndex = 0; // BW mode
+#endif
+    EPD_dispInit();
+}
+
+// ── EPD fast init ──
+
+void epdInitFast() { epdInit(); }
+
+// ── BW full refresh ──
+
+void epdDisplay(const uint8_t *image) {
+    int w = EPD_WIDTH / 8;
+    epdInit();
+
+    EPD_SendCommand(0x10);
+    delay(2);
+    for (int i = 0; i < w * EPD_HEIGHT; i++) {
+        EPD_SendData(0xFF);
+    }
+
+    EPD_SendCommand(0x13);
+    delay(2);
+    for (int i = 0; i < w * EPD_HEIGHT; i++) {
+        EPD_SendData(image[i]);
+    }
+
+    EPD_dispMass[EPD_dispIndex].show();
+}
+
+// ── Deep clear (multi-cycle flush) ──
+
+void epdDisplayDeepClear(const uint8_t *image) {
+    epdDisplay(image);
+}
+
+// ── Tricolor display (2bpp packed data) ──
+
+void epdDisplay2bpp(const uint8_t *image2bpp) {
+#if EPD_BPP >= 2
+    int w = EPD_WIDTH / 8;
+    int total = w * EPD_HEIGHT;
+    epdInit();
+
+    uint8_t *blackBuf = (uint8_t *)malloc(total);
+    uint8_t *redBuf = (uint8_t *)malloc(total);
+    if (!blackBuf || !redBuf) {
+        Serial.println("[EPD] 2bpp buffer alloc failed");
+        free(blackBuf);
+        free(redBuf);
+        return;
+    }
+    memset(blackBuf, 0xFF, total);
+    memset(redBuf, 0x00, total);
+
+    for (int y = 0; y < EPD_HEIGHT; y++) {
+        for (int x = 0; x < EPD_WIDTH; x++) {
+            int index = (y * EPD_WIDTH + x) / 4;
+            int bitOffset = ((y * EPD_WIDTH + x) % 4) * 2;
+            uint8_t color = (image2bpp[index] >> (6 - bitOffset)) & 0x03;
+            if (color == 0x02) color = 0x01; // map yellow to red
+
+            int bufIndex = y * w + (x / 8);
+            int bitPos = x % 8;
+
+            if (color == 0x00) { // Black
+                blackBuf[bufIndex] &= ~(0x80 >> bitPos);
+                redBuf[bufIndex] |= (0x80 >> bitPos);
+            } else if (color == 0x01) { // Red
+                redBuf[bufIndex] |= (0x80 >> bitPos);
+                blackBuf[bufIndex] |= (0x80 >> bitPos);
+            } else { // White (0x03)
+                blackBuf[bufIndex] |= (0x80 >> bitPos);
+                redBuf[bufIndex] &= ~(0x80 >> bitPos);
+            }
+        }
+    }
+
+    EPD_SendCommand(0x10);
+    delay(2);
+    for (int i = 0; i < total; i++) {
+        EPD_SendData(blackBuf[i]);
+    }
+
+    EPD_SendCommand(0x13);
+    delay(2);
+    for (int i = 0; i < total; i++) {
+        EPD_SendData(redBuf[i]);
+    }
+
+    free(blackBuf);
+    free(redBuf);
+
+    EPD_dispMass[EPD_dispIndex].show();
+#else
+    epdDisplay(image2bpp);
+#endif
+}
+
+// ── Fast refresh (same as full for WFT panel) ──
+
+void epdDisplayFast(const uint8_t *image) {
+    epdDisplay(image);
+}
+
+bool epdSupportsPartialRefresh() {
+    return false;
+}
+
+// ── Partial display (not supported on LG, fallback to full) ──
+
+void epdPartialDisplay(uint8_t *data, int xStart, int yStart, int xEnd, int yEnd) {
+    (void)xStart; (void)yStart; (void)xEnd; (void)yEnd;
+    epdDisplay(data);
+}
+
+// ── Sleep ──
+
+void epdPartialDisplayWithOld(uint8_t *data, const uint8_t *oldData, int xStart, int yStart, int xEnd, int yEnd) {
+    (void)oldData;
+    epdPartialDisplay(data, xStart, yStart, xEnd, yEnd);
+}
+
+void epdSleep() {
+    EPD_SendCommand(0x02); // power off
+    EPD_WaitUntilIdle();
+    EPD_Send_1(0x07, 0xA5); // deep sleep
+}
+
 #else
 // ── Other panel sizes: GxEPD2 (hardware SPI) ─────────────────
 
@@ -577,7 +798,7 @@ void epdSleep() {
       GxEPD2_420_GDEY042T81(PIN_EPD_CS, PIN_EPD_DC, PIN_EPD_RST, PIN_EPD_BUSY));
 #elif defined(EPD_PANEL_42_GXEPD2_GYE042A87)
   #include <other/GxEPD2_420_GYE042A87.h>
-  GxEPD2_BW<GxEPD2_420_GYE042A87, GxEPD2_420_GYE042A87::HEIGHT / 4> display(
+  GxEPD2_BW<GxEPD2_420_GYE042A87, GxEPD2_420_GYE042A87::HEIGHT> display(
       GxEPD2_420_GYE042A87(PIN_EPD_CS, PIN_EPD_DC, PIN_EPD_RST, PIN_EPD_BUSY));
 #elif defined(EPD_PANEL_42_GXEPD2_420)
   #include <epd/GxEPD2_420.h>
@@ -614,6 +835,10 @@ void epdSleep() {
           }
       }
   }
+#elif defined(EPD_PANEL_583_UC8179)
+  #include <gdeq/GxEPD2_583_GDEQ0583T31.h>
+  GxEPD2_BW<GxEPD2_583_GDEQ0583T31, GxEPD2_583_GDEQ0583T31::HEIGHT / 4> display(
+      GxEPD2_583_GDEQ0583T31(PIN_EPD_CS, PIN_EPD_DC, PIN_EPD_RST, PIN_EPD_BUSY));
 #elif defined(EPD_PANEL_583)
   #include <gdeq/GxEPD2_583_GDEQ0583T31.h>
   GxEPD2_BW<GxEPD2_583_GDEQ0583T31, GxEPD2_583_GDEQ0583T31::HEIGHT / 4> display(
@@ -623,7 +848,7 @@ void epdSleep() {
   GxEPD2_BW<GxEPD2_750_T7, GxEPD2_750_T7::HEIGHT / 4> display(
       GxEPD2_750_T7(PIN_EPD_CS, PIN_EPD_DC, PIN_EPD_RST, PIN_EPD_BUSY));
 #else
-  #error "No EPD panel type defined. Use -DEPD_PANEL_42_SSD1683_BW, -DEPD_PANEL_42_DKE_RY683, -DEPD_PANEL_42_GDEM042F52, -DEPD_PANEL_42_GXEPD2_T81, -DEPD_PANEL_42_GXEPD2_GYE042A87, -DEPD_PANEL_42_GXEPD2_420, -DEPD_PANEL_42_GXEPD2_M01, -DEPD_PANEL_29, -DEPD_PANEL_583, or -DEPD_PANEL_75"
+  #error "No EPD panel type defined. Use -DEPD_PANEL_42_SSD1683_BW, -DEPD_PANEL_42_DKE_RY683, -DEPD_PANEL_42_GDEM042F52, -DEPD_PANEL_42_GXEPD2_T81, -DEPD_PANEL_42_GXEPD2_GYE042A87, -DEPD_PANEL_42_GXEPD2_420, -DEPD_PANEL_42_GXEPD2_M01, -DEPD_PANEL_29, -DEPD_PANEL_583_UC8179, -DEPD_PANEL_583, or -DEPD_PANEL_75"
 #endif
 
 static bool _initialized = false;
@@ -684,6 +909,11 @@ void epdDisplay(const uint8_t *image) {
 }
 
 void epdDisplayFast(const uint8_t *image) {
+#if defined(EPD_PANEL_583_UC8179)
+    // 583 UC8179: always full refresh (GxEPD2 refresh(false)); avoids partial LUT ghosting.
+    epdDisplay(image);
+    return;
+#endif
 #if defined(EPD_PANEL_42_GXEPD2_GYE042A87)
     epdDisplay(image);
     return;
@@ -702,15 +932,50 @@ void epdDisplayFast(const uint8_t *image) {
         false
     );
 #else
-    display.writeImage(image, 0, 0, W, H, false, false, false);
+    display.writeImage(image, 0, 0, W, H, false, false, true);
 #endif
     display.refresh(true);
     display.powerOff();
 }
 
+void epdDisplayDeepClear(const uint8_t *image) {
+    epdInit();
+
+    uint8_t *clearBuf = (uint8_t *)malloc(IMG_BUF_LEN);
+    if (clearBuf) {
+        for (int pass = 0; pass < 4; pass++) {
+            memset(clearBuf, (pass % 2 == 0) ? 0x00 : 0xFF, IMG_BUF_LEN);
+            display.writeImage(clearBuf, 0, 0, W, H, false, false, true);
+            display.refresh(false);
+        }
+        free(clearBuf);
+        display.powerOff();
+    }
+
+    epdDisplay(image);
+}
+
 void epdPartialDisplay(uint8_t *data, int xStart, int yStart, int xEnd, int yEnd) {
+    epdPartialDisplayWithOld(data, nullptr, xStart, yStart, xEnd, yEnd);
+}
+
+bool epdSupportsPartialRefresh() {
+#if defined(EPD_PANEL_29)
+    return false;
+#else
+    return true;
+#endif
+}
+
+void epdPartialDisplayWithOld(uint8_t *data, const uint8_t *oldData, int xStart, int yStart, int xEnd, int yEnd) {
     epdInit();
 #if defined(EPD_PANEL_29)
+    (void)data;
+    (void)oldData;
+    (void)xStart;
+    (void)yStart;
+    (void)xEnd;
+    (void)yEnd;
     rotate_landscape_to_panel(imgBuf);
     display.writeImage(
         rotated_buffer,
@@ -726,7 +991,13 @@ void epdPartialDisplay(uint8_t *data, int xStart, int yStart, int xEnd, int yEnd
 #else
     int w = xEnd - xStart;
     int h = yEnd - yStart;
-    display.writeImage(data, xStart, yStart, w, h, false, false, false);
+    if (oldData) {
+        display.epd2.writeImageAgain(oldData, xStart, yStart, w, h, false, false, true);
+        display.writeImage(data, xStart, yStart, w, h, false, false, true);
+    } else {
+        display.writeImage(data, xStart, yStart, w, h, false, false, true);
+        display.epd2.writeImageAgain(data, xStart, yStart, w, h, false, false, true);
+    }
     display.refresh(xStart, yStart, w, h);
 #endif
     display.powerOff();
@@ -743,3 +1014,4 @@ void epdSleep() {
 #endif
 
 #endif
+#endif // EPD_PANEL_42_SSD1683_BW

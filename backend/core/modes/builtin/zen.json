@@ -52,7 +52,7 @@
     "preset_props": {
       "padding_x": 18,
       "justify": "center",
-      "gap": 10,
+      "gap": 18,
       "word_inset_x": 60,
       "word_field": "word",
       "word_font": "noto_serif_regular",
@@ -61,6 +61,15 @@
       "source_font": "noto_serif_light",
       "source_font_size": 9
     },
+    "decorations": [
+      {
+        "icon": "zen_img",
+        "anchor": "top_left",
+        "size": 80,
+        "margin": 10,
+        "image_mode": "circle"
+      }
+    ],
     "footer": {
       "label": "??",
       "attribution_template": "— ...",
@@ -73,7 +82,8 @@
         "padding_x": 8,
         "word_inset_x": 44,
         "word_font_size": 56,
-        "source_field": null
+        "source_field": null,
+        "content_bias_px": 8
       },
       "footer": {
         "label": "??",
@@ -81,6 +91,24 @@
         "dashed": true,
         "height": 18
       }
+    },
+    "648x480": {
+      "preset_props": {
+        "padding_x": 22,
+        "gap": 12,
+        "word_inset_x": 82,
+        "word_font_size": 112,
+        "source_font_size": 11
+      },
+      "decorations": [
+        {
+          "icon": "zen_img",
+          "anchor": "top_left",
+          "size": 64,
+          "margin": 10,
+          "image_mode": "circle"
+        }
+      ]
     },
     "800x480": {
       "preset_props": {

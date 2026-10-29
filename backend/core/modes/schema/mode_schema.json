@@ -377,7 +377,8 @@
       "required": ["type"],
       "properties": {
         "type": { "const": "spacer" },
-        "height": { "type": "integer", "default": 12 }
+        "height": { "type": "number", "default": 12, "description": "Logical spacing; multiplied by horizontal scale (~screen_w/400)." },
+        "height_px": { "type": "integer", "description": "Exact device-pixel height (ignored if unset). Overrides scaled height." }
       }
     },
     "icon_text_block": {
@@ -401,6 +402,13 @@
         "type": { "const": "two_column" },
         "left_width": { "type": "integer", "default": 120 },
         "gap": { "type": "integer", "default": 8 },
+        "left_x": { "type": "integer", "default": 0 },
+        "stack_when_short": { "type": "boolean", "default": true, "description": "If true, stack left then right when screen_h < 200" },
+        "left_valign": { "type": "string", "enum": ["top", "center", "bottom"], "default": "top" },
+        "right_valign": { "type": "string", "enum": ["top", "center", "bottom"], "default": "top" },
+        "row_min_height": { "type": "number", "description": "Minimum row height for valign (logical units × canvas scale)." },
+        "left_offset_px": { "type": "integer", "default": 0, "description": "Extra downward offset for left column (screen px, not scaled)." },
+        "right_offset_px": { "type": "integer", "default": 0, "description": "Extra downward offset for right column (screen px, not scaled)." },
         "left": { "type": "array", "items": { "$ref": "#/definitions/block" } },
         "right": { "type": "array", "items": { "$ref": "#/definitions/block" } }
       }
@@ -414,7 +422,11 @@
         "x": { "type": "integer", "default": 0 },
         "y": { "type": "integer", "default": 0 },
         "width": { "type": "integer" },
-        "height": { "type": "integer" }
+        "height": { "type": "integer" },
+        "fit": { "type": "string", "enum": ["fill", "stretch", "contain", "cover"], "default": "fill" },
+        "align_x": { "type": "string", "enum": ["left", "center", "right", "start", "end"], "default": "center" },
+        "align_y": { "type": "string", "enum": ["top", "center", "bottom", "start", "end"], "default": "center" },
+        "photo_enhance": { "type": "boolean", "default": false, "description": "Apply conservative photo contrast/sharpness enhancement before quantization." }
       }
     },
     "progress_bar_block": {

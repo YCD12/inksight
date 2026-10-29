@@ -83,6 +83,14 @@ def _resolve_uploaded_image_bytes(url: str) -> bytes | None:
         return None
 
 
+def _is_uploaded_image_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    return (parsed.path or "").startswith("/api/uploads/")
+
+
 def _has_cjk_text(text: str) -> bool:
     return any("\u4e00" <= ch <= "\u9fff" for ch in str(text or ""))
 
@@ -151,6 +159,35 @@ def _normalize_almanac_compact(value: Any) -> str:
 def _normalize_almanac_chongsha(value: Any) -> str:
     text = _normalize_almanac_compact(value)
     return text.replace("(", "（").replace(")", "）")
+
+
+def _rule_based_almanac_health_tip(result: dict[str, Any], fallback_tip: str) -> str:
+    yi = _normalize_almanac_list(result.get("fitness"), limit=3)
+    ji = _normalize_almanac_list(result.get("taboo"), limit=3)
+    solar_term = str(result.get("jieqi") or "").strip()
+
+    def has_any(text: str, words: tuple[str, ...]) -> bool:
+        return any(word in text for word in words)
+
+    if has_any(ji, ("动土", "修造", "破土", "安葬")):
+        return "少动土木，保持安稳"
+    if has_any(ji, ("出行", "远行", "赴任")):
+        return "行程从简，早些休息"
+    if has_any(ji, ("嫁娶", "订盟", "纳采")):
+        return "人情事务，宜缓不急"
+    if has_any(yi, ("沐浴", "扫舍", "除服")):
+        return "整理清洁，身心轻快"
+    if has_any(yi, ("祭祀", "祈福", "会友")):
+        return "静心处事，少些匆忙"
+    if solar_term in ("小暑", "大暑", "立夏", "夏至"):
+        return "暑热时节，清淡补水"
+    if solar_term in ("立冬", "小雪", "大雪", "冬至", "小寒", "大寒"):
+        return "寒时护暖，早睡养神"
+    if solar_term in ("立春", "雨水", "惊蛰", "春分", "清明", "谷雨"):
+        return "顺应春生，舒展身心"
+    if solar_term in ("立秋", "处暑", "白露", "秋分", "寒露", "霜降"):
+        return "秋燥渐起，润养作息"
+    return str(fallback_tip or "").strip() or "起居有常，饮食清淡"
 
 
 def _summarize_almanac_payload(result: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
@@ -292,7 +329,7 @@ async def _generate_almanac_health_tip(result: dict[str, Any], fallback_tip: str
             return cleaned[:20]
     except (LLMKeyMissingError, httpx.HTTPError, HTTPStatusError, OpenAIError, OSError, TypeError, ValueError):
         logger.warning("[ALMANAC] Failed to generate daily health tip", exc_info=True)
-    return fallback_tip
+    return _rule_based_almanac_health_tip(result, fallback_tip)
 
 
 def _make_aliyun_mt_client() -> AlimtClient | None:
@@ -521,6 +558,10 @@ async def _prefetch_images(content: dict, mode_def: dict) -> dict:
                 if local_bytes:
                     content[f"_prefetched_{field_name}"] = local_bytes
                     continue
+                if _is_uploaded_image_url(url):
+                    content[f"_invalid_{field_name}"] = "Image link expired"
+                    logger.warning("[JSONContent] Uploaded image link expired for field %s: %s", field_name, url)
+                    continue
                 try:
                     resp = await client.get(url)
                     if resp.status_code < 400:
@@ -646,6 +687,7 @@ async def generate_json_mode_content(
         image_model=image_model,
         config=config or {},
         date_ctx=date_ctx or {},
+        mac=mac,
         api_key=api_key,
         image_api_key=image_api_key,
     )
@@ -1051,14 +1093,38 @@ async def _generate_computed_content(mode_def: dict, content_cfg: dict, fallback
         config = kwargs.get("config") or {}
         lang = kwargs.get("language", "zh")
         mode_settings = config.get("mode_settings", {}) if isinstance(config.get("mode_settings", {}), dict) else {}
-        memo_text = mode_settings.get("memo_text", "") if isinstance(mode_settings.get("memo_text", ""), str) else ""
-        if not memo_text:
-            memo_text = config.get("memo_text", "")
-        memo_text = memo_text if isinstance(memo_text, str) else ""
-        if not memo_text:
-            default_hint = "Set your memo in the config page." if lang == "en" else "在配置页面设置你的便签内容"
-            memo_text = fallback.get("memo_text", default_hint)
-        return {"memo_text": memo_text}
+        items: list[dict[str, str]] = []
+        for i in range(1, 4):
+            tk = f"memo_title_{i}"
+            tv = mode_settings.get(tk, "") if isinstance(mode_settings.get(tk, ""), str) else ""
+            if not tv:
+                tv = config.get(tk, "")
+            tv = tv if isinstance(tv, str) else ""
+            ck = f"memo_text_{i}"
+            cv = mode_settings.get(ck, "") if isinstance(mode_settings.get(ck, ""), str) else ""
+            if not cv:
+                cv = config.get(ck, "")
+            cv = cv if isinstance(cv, str) else ""
+            if tv or cv:
+                items.append({"title": tv, "text": cv})
+        if not items:
+            fb_items = fallback.get("memo_items")
+            if isinstance(fb_items, list):
+                items = fb_items
+            else:
+                default_title = "TODO" if lang == "en" else "今日待办"
+                items = [{"title": default_title, "text": "1. \n2. \n3. "}]
+        return {"memo_items": items}
+
+    if provider == "vocab_review":
+        from .vocab_store import get_vocab_content
+
+        mac = str(kwargs.get("mac") or "").strip()
+        if not mac:
+            return dict(fallback)
+        result = dict(fallback)
+        result.update(await get_vocab_content(mac, kwargs.get("config") or {}))
+        return result
 
     if provider == "habit":
         config = kwargs.get("config") or {}
@@ -1086,18 +1152,57 @@ async def _generate_computed_content(mode_def: dict, content_cfg: dict, fallback
 
         completed = sum(1 for h in habits if h.get("done"))
         total = len(habits) if habits else 0
+
+        _HABIT_MOTTOS_ZH = [
+            "业精于勤荒于嬉",
+            "千里之行始于足下",
+            "贵在坚持",
+            "每天进步一点点",
+            "自律即自由",
+            "好习惯成就好人生",
+            "日拱一卒，功不唐捐",
+            "积跬步以至千里",
+            "今日事今日毕",
+            "坚持就是胜利",
+        ]
+        _HABIT_MOTTOS_EN = [
+            "Consistency is key",
+            "Small steps, big results",
+            "Discipline equals freedom",
+            "Progress, not perfection",
+            "One day at a time",
+            "Good habits shape great lives",
+            "Keep going, you're doing great",
+            "Every effort counts",
+            "Stay the course",
+            "Success is built daily",
+        ]
+        import random
+        motto = random.choice(_HABIT_MOTTOS_EN if lang == "en" else _HABIT_MOTTOS_ZH)
+
         if habits:
-            lines = [f"{h['name']} {h['status']}" for h in habits]
+            habit_lines = [f"{h['status']}  {h['name']}" for h in habits]
+            habit_list = "\n".join(habit_lines)
             if lang == "en":
-                lines.append(f"\nCompleted {completed}/{total} today")
+                habit_footer = f"Completed {completed}/{total} today · {motto}"
             else:
-                lines.append(f"\n今日已完成 {completed}/{total} 项")
-            summary = "\n".join(lines)
+                habit_footer = f"今日已完成 {completed}/{total} 项 · {motto}"
         else:
-            summary = fallback.get("summary", "")
+            habit_list = fallback.get("summary", "")
+            habit_footer = motto
+        # 保留 summary 兼容旧布局
+        summary_lines = [f"{h['name']} {h['status']}" for h in habits] if habits else []
+        if habits:
+            if lang == "en":
+                summary_lines.append(f"\nCompleted {completed}/{total} today")
+            else:
+                summary_lines.append(f"\n今日已完成 {completed}/{total} 项")
+        summary = "\n".join(summary_lines) if summary_lines else fallback.get("summary", "")
         return {
             "habits": habits,
             "summary": summary,
+            "habit_list": habit_list,
+            "habit_footer": habit_footer,
             "week_progress": completed,
             "week_total": total,
         }
@@ -1319,8 +1424,14 @@ async def _generate_computed_content(mode_def: dict, content_cfg: dict, fallback
             weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
             weekdays_short = ["一", "二", "三", "四", "五"]
 
+        custom_weekdays = mode_settings.get("weekdays")
+        if isinstance(custom_weekdays, list):
+            cleaned_weekdays = [str(item).strip() for item in custom_weekdays if str(item).strip()]
+            if cleaned_weekdays:
+                weekdays_short = cleaned_weekdays[:7]
+
         wd = now.weekday()
-        current_day = wd if wd < 5 else -1
+        current_day = wd if wd < len(weekdays_short) else -1
 
         current_period = -1
         for pi, p_label in enumerate(periods):
@@ -1337,7 +1448,7 @@ async def _generate_computed_content(mode_def: dict, content_cfg: dict, fallback
             grid: list[list[str]] = []
             for pi in range(len(periods)):
                 row = []
-                for di in range(5):
+                for di in range(len(weekdays_short)):
                     row.append(str(courses.get(f"{di}-{pi}", "")))
                 grid.append(row)
             if is_en:
@@ -1602,6 +1713,14 @@ def _apply_post_process(result: dict, content_cfg: dict) -> dict:
             result[field_name] = val[:1] if val else ""
         elif rule == "strip_quotes":
             result[field_name] = val.strip('""\u201c\u201d\u300c\u300d')
+        elif rule == "recipe_normalize_item_sep":
+            s = val.strip()
+            parts = [
+                p.strip()
+                for p in re.split(r"\s*[,，、]\s*|\s*[·・]\s*", s)
+                if p and p.strip()
+            ]
+            result[field_name] = " · ".join(parts) if parts else s
     return result
 
 
@@ -1646,7 +1765,7 @@ def _parse_json_output(text: str, content_cfg: dict, fallback: dict) -> dict:
             return {f: data.get(f, fallback.get(f, "")) for f in fields}
         return data
     except (json.JSONDecodeError, KeyError) as e:
-        logger.error(f"[JSONContent] JSON parse failed: {e}")
+        logger.error("[JSONContent] JSON parse failed: %s | raw[:200]: %s", e, text[:200])
         return dict(fallback)
 
 
@@ -1657,6 +1776,7 @@ def _parse_llm_json_output(text: str, content_cfg: dict, fallback: dict) -> dict
         cleaned = _clean_json_response(text)
         data = json.loads(cleaned)
         if not isinstance(data, dict):
+            logger.warning("[JSONContent] LLM returned non-dict JSON, falling back. Raw: %s", text[:200])
             return dict(fallback)
 
         result = {}
@@ -1668,5 +1788,5 @@ def _parse_llm_json_output(text: str, content_cfg: dict, fallback: dict) -> dict
             result[field_name] = data.get(field_name, default)
         return result
     except (json.JSONDecodeError, KeyError) as e:
-        logger.error(f"[JSONContent] JSON parse failed: {e}")
+        logger.error("[JSONContent] LLM JSON parse failed: %s | raw[:200]: %s", e, text[:200])
         return dict(fallback)

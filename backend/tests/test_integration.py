@@ -396,6 +396,39 @@ async def test_config_save_preserves_active_runtime_mode(client):
 
 
 @pytest.mark.asyncio
+async def test_stale_active_runtime_mode_reports_interval_for_web_state(client):
+    mac = "AA:BB:CC:DD:EE:13"
+    headers = await provision_device_headers(client, mac)
+    from core.config_store import update_device_state
+
+    claim_resp = await client.post(f"/api/device/{mac}/claim-token", headers=headers)
+    assert claim_resp.status_code == 200
+
+    await register_user(client, "stale_runtime")
+    consume_resp = await client.post("/api/claim/consume", json={"token": claim_resp.json()["token"]})
+    assert consume_resp.status_code == 200
+
+    heartbeat_resp = await client.post(
+        f"/api/v1/device/{mac}/heartbeat",
+        json={"battery_voltage": 3.91, "wifi_rssi": -42},
+        headers=headers,
+    )
+    assert heartbeat_resp.status_code == 200
+
+    await update_device_state(
+        mac,
+        runtime_mode="active",
+        last_state_poll_at="2000-01-01T00:00:00",
+    )
+
+    state_resp = await client.get(f"/api/device/{mac}/state")
+    assert state_resp.status_code == 200
+    state = state_resp.json()
+    assert state["is_online"] is True
+    assert state["runtime_mode"] == "interval"
+
+
+@pytest.mark.asyncio
 async def test_config_save_persists_always_active_flag(client):
     mac = "AA:BB:CC:DD:EE:12"
     headers = await provision_device_headers(client, mac)
@@ -1152,19 +1185,6 @@ async def test_custom_modes_end_to_end(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Legacy pages routing
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_config_page_bridge_and_legacy_page(client):
-    bridge_resp = await client.get("/config")
-    assert bridge_resp.status_code == 200
-    assert "Device configuration moved to the web app." in bridge_resp.text
-    assert "/legacy/config" in bridge_resp.text
-
-    legacy_resp = await client.get("/legacy/config")
-    assert legacy_resp.status_code == 200
-    assert "legacy-console-banner" not in legacy_resp.text
-    assert "/webconfig/role-banner.js" in legacy_resp.text
 
 
 @pytest.mark.asyncio

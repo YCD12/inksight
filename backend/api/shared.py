@@ -110,8 +110,11 @@ async def lifespan(app):
     await init_stats_db()
     from core.cache import init_cache_db
     from core.db import close_all
+    from core.static_store import init_static_tables, migrate_device_state_columns
 
     await init_cache_db()
+    await init_static_tables()
+    await migrate_device_state_columns()
 
     yield
 
@@ -137,7 +140,7 @@ class _NoopLimiter:
 
 
 try:
-    limiter = Limiter(key_func=_rate_limit_key)
+    limiter = Limiter(key_func=_rate_limit_key, storage_uri="memory://")
 except Exception as exc:  # pragma: no cover - depends on optional runtime dependency
     logger.warning("Rate limiter disabled due to init error: %s", exc)
     limiter = _NoopLimiter()
@@ -183,9 +186,11 @@ async def require_membership_access(
     mac = validate_mac_param(mac, lang)
     user_id = await resolve_user_id(request, ink_session)
     if user_id is None:
+        logger.warning("[AUTH] require_membership_access: user_id is None for mac=%s", mac)
         raise HTTPException(status_code=401, detail=msg("auth.login_required", lang))
     membership = await get_device_membership(mac, user_id)
     if not membership:
+        logger.warning("[AUTH] require_membership_access: no membership for mac=%s user_id=%s", mac, user_id)
         raise HTTPException(status_code=403, detail=msg("auth.no_device_access", lang))
     if owner_only and membership.get("role") != "owner":
         raise HTTPException(status_code=403, detail=msg("auth.owner_only", lang))
@@ -202,6 +207,8 @@ async def ensure_web_or_device_access(
     allow_device_token: bool = True,
 ) -> dict:
     mac = validate_mac_param(mac)
+    logger.info("[AUTH] ensure_web_or_device_access: mac=%s, has_device_token=%s, has_ink_session=%s",
+                mac, bool(x_device_token), bool(ink_session))
     if allow_device_token and x_device_token:
         await require_device_token(mac, x_device_token)
         return {"mode": "device", "role": "device"}
@@ -335,6 +342,7 @@ async def build_image(
     preview_city_override: Optional[str] = None,
     preview_mode_override: Optional[dict] = None,
     preview_memo_text: Optional[str] = None,
+    preview_memo_settings: Optional[dict] = None,
     preview_ui_language: Optional[str] = None,
     current_user_id: Optional[int] = None,
     user_api_key: Optional[str] = None,
@@ -568,7 +576,7 @@ async def build_image(
         quota_user_id = current_user_id
         logger.debug("[QUOTA] Using current_user_id=%s for Web preview", current_user_id)
 
-    if preview_city_override or preview_mode_override or preview_memo_text:
+    if preview_city_override or preview_mode_override or preview_memo_text or preview_memo_settings:
         config = copy.deepcopy(config or {})
         mode_overrides = dict(config.get("mode_overrides") or {})
         current_mode_override = dict(mode_overrides.get(persona) or {})
@@ -593,6 +601,13 @@ async def build_image(
                 config["modeOverrides"] = mode_overrides
                 config["memo_text"] = memo_clean
                 config["memoText"] = memo_clean
+            if isinstance(preview_memo_settings, dict) and preview_memo_settings:
+                ms = dict(current_mode_override.get("mode_settings") or {})
+                ms.update(preview_memo_settings)
+                current_mode_override["mode_settings"] = ms
+                mode_overrides[persona] = current_mode_override
+                config["mode_overrides"] = mode_overrides
+                config["modeOverrides"] = mode_overrides
 
     # 无设备预览（/preview 等）：按页面站点语言（中/英）决定 mode_language。
     # 设备配置页预览（有 mac）：沿用 configs 中保存的 mode_language，不被 ui_language 覆盖。
@@ -1081,6 +1096,8 @@ def build_firmware_manifest(version: str, download_url: str, chip_family: str = 
 
 def chip_family_from_asset_name(asset_name: str) -> str:
     name = (asset_name or "").lower()
+    if "_s3" in name or "esp32s3" in name or "esp32-s3" in name:
+        return "ESP32-S3"
     if "wroom32e" in name or "_esp32" in name:
         return "ESP32"
     if "_c3" in name or "esp32c3" in name:

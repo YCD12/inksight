@@ -1,4 +1,5 @@
 import { apiFetch, apiRequest, buildApiUrl } from '@/lib/api-client';
+import * as FileSystem from 'expo-file-system/legacy';
 
 export type DeviceSummary = {
   mac: string;
@@ -39,6 +40,7 @@ export type DeviceConfig = {
   llmProvider?: string;
   llmModel?: string;
   modeOverrides?: Record<string, Record<string, unknown>>;
+  screenSize?: string;
 };
 
 export type DeviceMember = {
@@ -275,6 +277,28 @@ export async function pushPreviewImageToDevice(mac: string, token: string, previ
   }
 
   return response.json() as Promise<{ ok: boolean; message: string }>;
+}
+
+export async function uploadImage(uri: string, mimeType: string, fileName: string): Promise<string> {
+  const uploadType = mimeType || (fileName?.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg');
+  const result = await FileSystem.uploadAsync(buildApiUrl('/uploads'), uri, {
+    httpMethod: 'POST',
+    uploadType: FileSystem.FileSystemUploadType.BINARY_CONTENT,
+    headers: {
+      'x-upload-content-type': uploadType,
+    },
+  });
+  if (result.status < 200 || result.status >= 300) {
+    let msg = `upload failed: ${result.status}`;
+    try {
+      const payload = JSON.parse(result.body || '{}') as { message?: string; error?: string };
+      msg = payload.message || payload.error || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+  const data = JSON.parse(result.body || '{}') as { url?: string };
+  if (!data.url) throw new Error("upload failed: missing url");
+  return data.url;
 }
 
 export function getDeviceShareImageUrl(mac: string, width = 800, height = 450) {

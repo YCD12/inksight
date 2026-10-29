@@ -86,6 +86,20 @@
         "height": 18
       }
     },
+    "648x480": {
+      "preset_props": {
+        "top_gap": 12,
+        "gap": 10,
+        "meta_font_size": 12,
+        "separator_width": 68,
+        "question_inset_x": 44,
+        "question_font_size": 20,
+        "question_max_lines": 4,
+        "hint_font_size": 12,
+        "answer_divider_margin_x": 58,
+        "answer_font_size": 14
+      }
+    },
     "800x480": {
       "preset_props": {
         "top_gap": 16,
